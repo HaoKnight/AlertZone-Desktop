@@ -1,0 +1,24 @@
+name: Build + Release AlertZone Desktop
+
+run-name: "Build + Release AlertZone Desktop #${{ github.run_number }}"
+
+on:
+  workflow_dispatch:
+
+permissions:
+  actions: read
+  contents: write
+
+jobs:
+  build:
+    name: Build all platforms
+    uses: ./.github/workflows/Build-AlertZone-Desktop.yml
+
+  release:
+    name: Publish verified build
+    needs: build
+    uses: ./.github/workflows/Release-AlertZone-Desktop.yml
+    with:
+      build_run_id: ${{ github.run_id }}
+      expected_workflow_path: .github/workflows/Build+Release-AlertZone-Desktop.yml
+    secrets: inherit

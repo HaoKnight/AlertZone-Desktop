@@ -9,6 +9,16 @@ on:
         description: "成功完成的 Build AlertZone Desktop 工作流 run ID"
         required: true
         type: string
+  workflow_call:
+    inputs:
+      build_run_id:
+        description: "包含待发布 Artifact 的顶层工作流 run ID"
+        required: true
+        type: string
+      expected_workflow_path:
+        description: "该 run 对应的工作流文件路径"
+        required: true
+        type: string
 
 permissions:
   actions: read
@@ -32,7 +42,7 @@ jobs:
         id: build_run
         env:
           BUILD_RUN_ID: ${{ inputs.build_run_id }}
-          EXPECTED_WORKFLOW_PATH: .github/workflows/Build-AlertZone-Desktop.yml
+          EXPECTED_WORKFLOW_PATH: ${{ inputs.expected_workflow_path || '.github/workflows/Build-AlertZone-Desktop.yml' }}
         shell: bash
         run: |
           set -euo pipefail

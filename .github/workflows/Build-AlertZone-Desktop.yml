@@ -4,6 +4,7 @@ run-name: "Build AlertZone Desktop #${{ github.run_number }}"
 
 on:
   workflow_dispatch:
+  workflow_call:
 
 permissions:
   contents: read
