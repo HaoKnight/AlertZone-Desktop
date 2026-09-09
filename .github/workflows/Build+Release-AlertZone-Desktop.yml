@@ -12,11 +12,16 @@ permissions:
 jobs:
   build:
     name: Build all platforms
+    permissions:
+      contents: read
     uses: ./.github/workflows/Build-AlertZone-Desktop.yml
 
   release:
     name: Publish verified build
     needs: build
+    permissions:
+      actions: read
+      contents: write
     uses: ./.github/workflows/Release-AlertZone-Desktop.yml
     with:
       build_run_id: ${{ github.run_id }}
