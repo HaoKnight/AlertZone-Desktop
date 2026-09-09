@@ -37,10 +37,6 @@ jobs:
             expected_arch: x64
             public_arch: x64
 
-    defaults:
-      run:
-        working-directory: AlertZone Desktop
-
     env:
       PYTHONUTF8: "1"
       PYTHONIOENCODING: utf-8
@@ -58,8 +54,8 @@ jobs:
           architecture: ${{ matrix.python_arch }}
           cache: pip
           cache-dependency-path: |
-            AlertZone Desktop/requirements.txt
-            AlertZone Desktop/requirements-build.txt
+            requirements.txt
+            requirements-build.txt
 
       - name: Verify native architecture
         shell: bash
@@ -281,7 +277,7 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: AlertZone Desktop_${{ steps.version.outputs.version }}_x64-setup.exe
-          path: AlertZone Desktop/artifacts/AlertZone Desktop_${{ steps.version.outputs.version }}_x64-setup.exe
+          path: artifacts/AlertZone Desktop_${{ steps.version.outputs.version }}_x64-setup.exe
           if-no-files-found: error
           retention-days: 30
           compression-level: 0
@@ -291,7 +287,7 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: AlertZone Desktop_${{ steps.version.outputs.version }}_x64-portable.exe
-          path: AlertZone Desktop/artifacts/AlertZone Desktop_${{ steps.version.outputs.version }}_x64-portable.exe
+          path: artifacts/AlertZone Desktop_${{ steps.version.outputs.version }}_x64-portable.exe
           if-no-files-found: error
           retention-days: 30
           compression-level: 0
@@ -301,7 +297,7 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: AlertZone Desktop_${{ steps.version.outputs.version }}_${{ matrix.public_arch }}.dmg
-          path: AlertZone Desktop/artifacts/AlertZone Desktop_${{ steps.version.outputs.version }}_${{ matrix.public_arch }}.dmg
+          path: artifacts/AlertZone Desktop_${{ steps.version.outputs.version }}_${{ matrix.public_arch }}.dmg
           if-no-files-found: error
           retention-days: 30
           compression-level: 0

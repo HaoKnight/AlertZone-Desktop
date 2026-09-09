@@ -104,8 +104,8 @@ jobs:
           from pathlib import Path
 
           version_files = (
-              Path("AlertZone Desktop/build.py"),
-              Path("AlertZone Desktop/src/AlertZone_Desktop.py"),
+              Path("build.py"),
+              Path("src/AlertZone_Desktop.py"),
           )
           versions = {}
           for path in version_files:
