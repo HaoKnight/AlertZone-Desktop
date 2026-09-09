@@ -1,0 +1,442 @@
+name: Release AlertZone Desktop
+
+run-name: "Release AlertZone Desktop from build #${{ inputs.build_run_id }}"
+
+on:
+  workflow_dispatch:
+    inputs:
+      build_run_id:
+        description: "成功完成的 Build AlertZone Desktop 工作流 run ID"
+        required: true
+        type: string
+
+permissions:
+  actions: read
+  contents: write
+
+concurrency:
+  group: release-alertzone-desktop
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: Publish existing AlertZone Desktop build
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      GITHUB_TOKEN: ${{ github.token }}
+      GH_TOKEN: ${{ github.token }}
+
+    steps:
+      - name: Validate requested build run
+        id: build_run
+        env:
+          BUILD_RUN_ID: ${{ inputs.build_run_id }}
+          EXPECTED_WORKFLOW_PATH: .github/workflows/Build-AlertZone-Desktop.yml
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ ! "$BUILD_RUN_ID" =~ ^[1-9][0-9]*$ ]]; then
+            echo "build_run_id must be a positive GitHub Actions run ID." >&2
+            exit 1
+          fi
+
+          run_json="$RUNNER_TEMP/alertzone-desktop-build-run.json"
+          gh api --method GET \
+            "repos/${GITHUB_REPOSITORY}/actions/runs/${BUILD_RUN_ID}" > "$run_json"
+
+          python3 - "$run_json" <<'PY'
+          import json
+          import os
+          import re
+          import sys
+
+          path = sys.argv[1]
+          with open(path, encoding="utf-8") as file:
+              run = json.load(file)
+
+          errors = []
+          repository = run.get("repository") or {}
+          if repository.get("full_name") != os.environ["GITHUB_REPOSITORY"]:
+              errors.append(
+                  "The requested run does not belong to the current repository."
+              )
+          if run.get("path") != os.environ["EXPECTED_WORKFLOW_PATH"]:
+              errors.append(
+                  "The requested run is not from "
+                  f"{os.environ['EXPECTED_WORKFLOW_PATH']}: {run.get('path')!r}"
+              )
+          if run.get("status") != "completed" or run.get("conclusion") != "success":
+              errors.append(
+                  "The requested build run must be completed successfully; "
+                  f"got status={run.get('status')!r}, "
+                  f"conclusion={run.get('conclusion')!r}."
+              )
+
+          head_sha = run.get("head_sha")
+          if not isinstance(head_sha, str) or not re.fullmatch(r"[0-9a-f]{40}", head_sha):
+              errors.append(f"The requested build run has an invalid head SHA: {head_sha!r}.")
+
+          if errors:
+              raise SystemExit("\n".join(errors))
+
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+              output.write(f"head_sha={head_sha}\n")
+          print(f"Validated build run {run['id']} at commit {head_sha}.")
+          PY
+
+      - name: Check out the exact build commit
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ steps.build_run.outputs.head_sha }}
+          fetch-depth: 1
+          persist-credentials: true
+
+      - name: Read and validate version from the build commit
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import ast
+          import os
+          import re
+          from pathlib import Path
+
+          version_files = (
+              Path("AlertZone Desktop/build.py"),
+              Path("AlertZone Desktop/src/AlertZone_Desktop.py"),
+          )
+          versions = {}
+          for path in version_files:
+              tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+              for statement in tree.body:
+                  if not isinstance(statement, (ast.Assign, ast.AnnAssign)):
+                      continue
+                  targets = (
+                      statement.targets
+                      if isinstance(statement, ast.Assign)
+                      else [statement.target]
+                  )
+                  if any(
+                      isinstance(target, ast.Name) and target.id == "APP_VERSION"
+                      for target in targets
+                  ):
+                      versions[str(path)] = ast.literal_eval(statement.value)
+                      break
+              else:
+                  raise SystemExit(f"APP_VERSION is missing from {path}")
+
+          unique_versions = set(versions.values())
+          if len(unique_versions) != 1:
+              details = ", ".join(
+                  f"{path}={version!r}" for path, version in versions.items()
+              )
+              raise SystemExit(f"APP_VERSION mismatch: {details}")
+
+          version = unique_versions.pop()
+          if not isinstance(version, str) or not re.fullmatch(r"\d+\.\d+\.\d+", version):
+              raise SystemExit(f"Invalid semantic version: {version!r}")
+
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+              output.write(f"version={version}\n")
+          print(f"AlertZone Desktop version at build commit: {version}")
+          PY
+
+      - name: Refuse an existing tag or release
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="v${VERSION}"
+
+          assert_absent() {
+            local endpoint="$1"
+            local label="$2"
+            local body_file
+            local status
+            body_file="$(mktemp "$RUNNER_TEMP/alertzone-release-response.XXXXXX")"
+            status="$(curl --silent --show-error \
+              --output "$body_file" \
+              --write-out '%{http_code}' \
+              --header "Accept: application/vnd.github+json" \
+              --header "Authorization: Bearer ${GITHUB_TOKEN}" \
+              --header "X-GitHub-Api-Version: 2022-11-28" \
+              "https://api.github.com/${endpoint}")"
+            case "$status" in
+              404)
+                return 0
+                ;;
+              200)
+                echo "${label} already exists: ${tag}. Refusing to overwrite it." >&2
+                cat "$body_file" >&2
+                return 1
+                ;;
+              *)
+                echo "Could not check ${label} ${tag}; GitHub API returned HTTP ${status}." >&2
+                cat "$body_file" >&2
+                return 1
+                ;;
+            esac
+          }
+
+          assert_absent "repos/${GITHUB_REPOSITORY}/git/ref/tags/${tag}" "Git tag"
+          assert_absent "repos/${GITHUB_REPOSITORY}/releases/tags/${tag}" "Release"
+
+      - name: Validate the four build artifacts
+        env:
+          BUILD_RUN_ID: ${{ inputs.build_run_id }}
+          VERSION: ${{ steps.version.outputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          artifacts_json="$RUNNER_TEMP/alertzone-desktop-artifacts.json"
+          gh api --method GET \
+            "repos/${GITHUB_REPOSITORY}/actions/runs/${BUILD_RUN_ID}/artifacts?per_page=100" \
+            > "$artifacts_json"
+
+          python3 - "$artifacts_json" <<'PY'
+          import json
+          import os
+          import sys
+
+          version = os.environ["VERSION"]
+          expected = {
+              f"AlertZone Desktop_{version}_x64-setup.exe",
+              f"AlertZone Desktop_{version}_x64-portable.exe",
+              f"AlertZone Desktop_{version}_arm64.dmg",
+              f"AlertZone Desktop_{version}_x64.dmg",
+          }
+          with open(sys.argv[1], encoding="utf-8") as file:
+              response = json.load(file)
+          artifacts = response.get("artifacts")
+          if not isinstance(artifacts, list):
+              raise SystemExit("GitHub returned an invalid artifacts response.")
+
+          names = [artifact.get("name") for artifact in artifacts]
+          if len(artifacts) != 4 or set(names) != expected or len(set(names)) != 4:
+              raise SystemExit(
+                  "Expected exactly these four build artifacts, but received: "
+                  f"{names!r}; expected: {sorted(expected)!r}"
+              )
+          for artifact in artifacts:
+              if artifact.get("expired"):
+                  raise SystemExit(f"Build artifact has expired: {artifact['name']}")
+              if not isinstance(artifact.get("size_in_bytes"), int) or artifact["size_in_bytes"] <= 0:
+                  raise SystemExit(f"Build artifact is empty or invalid: {artifact['name']}")
+
+          print("Validated four non-expired build artifacts:")
+          for name in sorted(names):
+              print(f"- {name}")
+          PY
+
+      - name: Download Windows x64 setup artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: AlertZone Desktop_${{ steps.version.outputs.version }}_x64-setup.exe
+          path: release-assets/windows-setup
+          repository: ${{ github.repository }}
+          run-id: ${{ inputs.build_run_id }}
+          github-token: ${{ github.token }}
+
+      - name: Download Windows x64 portable artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: AlertZone Desktop_${{ steps.version.outputs.version }}_x64-portable.exe
+          path: release-assets/windows-portable
+          repository: ${{ github.repository }}
+          run-id: ${{ inputs.build_run_id }}
+          github-token: ${{ github.token }}
+
+      - name: Download macOS Apple Silicon artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: AlertZone Desktop_${{ steps.version.outputs.version }}_arm64.dmg
+          path: release-assets/macos-arm64
+          repository: ${{ github.repository }}
+          run-id: ${{ inputs.build_run_id }}
+          github-token: ${{ github.token }}
+
+      - name: Download macOS Intel artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: AlertZone Desktop_${{ steps.version.outputs.version }}_x64.dmg
+          path: release-assets/macos-x64
+          repository: ${{ github.repository }}
+          run-id: ${{ inputs.build_run_id }}
+          github-token: ${{ github.token }}
+
+      - name: Verify downloaded filenames, counts, and file types
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import os
+          from pathlib import Path
+
+          version = os.environ["VERSION"]
+          expected = {
+              "Windows x64 setup": (
+                  Path("release-assets/windows-setup"),
+                  f"AlertZone Desktop_{version}_x64-setup.exe",
+                  b"MZ",
+              ),
+              "Windows x64 portable": (
+                  Path("release-assets/windows-portable"),
+                  f"AlertZone Desktop_{version}_x64-portable.exe",
+                  b"MZ",
+              ),
+              "macOS Apple Silicon": (
+                  Path("release-assets/macos-arm64"),
+                  f"AlertZone Desktop_{version}_arm64.dmg",
+                  b"koly",
+              ),
+              "macOS Intel": (
+                  Path("release-assets/macos-x64"),
+                  f"AlertZone Desktop_{version}_x64.dmg",
+                  b"koly",
+              ),
+          }
+
+          for label, (directory, filename, signature) in expected.items():
+              expected_file = directory / filename
+              files = sorted(path for path in directory.rglob("*") if path.is_file())
+              if files != [expected_file]:
+                  raise SystemExit(
+                      f"{label} must contain exactly {expected_file}, got {files!r}"
+                  )
+              if expected_file.stat().st_size == 0:
+                  raise SystemExit(f"{label} is empty: {expected_file}")
+              with expected_file.open("rb") as file:
+                  if signature == b"MZ":
+                      actual = file.read(2)
+                  else:
+                      file.seek(-512, os.SEEK_END)
+                      actual = file.read(4)
+              if actual != signature:
+                  raise SystemExit(
+                      f"{label} has an unexpected file signature: {actual!r}"
+                  )
+              print(f"Verified {label}: {expected_file}")
+          PY
+
+      - name: Create draft release at the build commit
+        id: draft
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          BUILD_SHA: ${{ steps.build_run.outputs.head_sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="v${VERSION}"
+          release_json="$RUNNER_TEMP/alertzone-desktop-created-draft-release.json"
+          gh api --method POST "repos/${GITHUB_REPOSITORY}/releases" \
+            -f tag_name="$tag" \
+            -f target_commitish="$BUILD_SHA" \
+            -f name="AlertZone Desktop v${VERSION}" \
+            -F draft=true \
+            -F generate_release_notes=true \
+            > "$release_json"
+
+          python3 - "$release_json" <<'PY'
+          import json
+          import os
+          import re
+          import sys
+
+          with open(sys.argv[1], encoding="utf-8") as file:
+              release = json.load(file)
+
+          release_id = release.get("id")
+          expected_tag = f"v{os.environ['VERSION']}"
+          if not isinstance(release_id, int) or release_id <= 0:
+              raise SystemExit(f"GitHub returned an invalid draft release ID: {release_id!r}")
+          if release.get("tag_name") != expected_tag:
+              raise SystemExit(
+                  f"GitHub created an unexpected tag: {release.get('tag_name')!r}; "
+                  f"expected {expected_tag!r}"
+              )
+          if release.get("target_commitish") != os.environ["BUILD_SHA"]:
+              raise SystemExit(
+                  "GitHub created the release for an unexpected commit: "
+                  f"{release.get('target_commitish')!r}; "
+                  f"expected {os.environ['BUILD_SHA']!r}"
+              )
+
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+              output.write(f"release_id={release_id}\n")
+              output.write(f"tag={expected_tag}\n")
+          print(
+              f"Created draft release {release_id} with {expected_tag} "
+              f"at {os.environ['BUILD_SHA']}."
+          )
+          PY
+
+      - name: Upload all verified release assets
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          TAG: ${{ steps.draft.outputs.tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh release upload "$TAG" \
+            "release-assets/windows-setup/AlertZone Desktop_${VERSION}_x64-setup.exe#AlertZone Desktop_${VERSION}_x64-setup.exe" \
+            "release-assets/windows-portable/AlertZone Desktop_${VERSION}_x64-portable.exe#AlertZone Desktop_${VERSION}_x64-portable.exe" \
+            "release-assets/macos-arm64/AlertZone Desktop_${VERSION}_arm64.dmg#AlertZone Desktop_${VERSION}_arm64.dmg" \
+            "release-assets/macos-x64/AlertZone Desktop_${VERSION}_x64.dmg#AlertZone Desktop_${VERSION}_x64.dmg"
+
+      - name: Confirm all release assets uploaded
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          RELEASE_ID: ${{ steps.draft.outputs.release_id }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          release_json="$RUNNER_TEMP/alertzone-desktop-draft-release.json"
+          gh api --method GET \
+            "repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}" > "$release_json"
+
+          python3 - "$release_json" <<'PY'
+          import json
+          import os
+          import sys
+
+          version = os.environ["VERSION"]
+          uploaded_filenames = {
+              f"AlertZone Desktop_{version}_x64-setup.exe",
+              f"AlertZone Desktop_{version}_x64-portable.exe",
+              f"AlertZone Desktop_{version}_arm64.dmg",
+              f"AlertZone Desktop_{version}_x64.dmg",
+          }
+          # GitHub Release assets normalize spaces in the server-side asset name
+          # to dots. Keep the build/download names above unchanged and verify the
+          # canonical names actually returned by the Release API here.
+          expected = {filename.replace(" ", ".") for filename in uploaded_filenames}
+          with open(sys.argv[1], encoding="utf-8") as file:
+              release = json.load(file)
+          assets = release.get("assets")
+          names = [asset.get("name") for asset in assets] if isinstance(assets, list) else []
+          if len(assets or []) != 4 or set(names) != expected or len(set(names)) != 4:
+              raise SystemExit(
+                  "Draft release does not contain exactly the four expected "
+                  "GitHub-normalized asset names: "
+                  f"{names!r}; expected {sorted(expected)!r}"
+              )
+          for asset in assets:
+              if not isinstance(asset.get("size"), int) or asset["size"] <= 0:
+                  raise SystemExit(f"Uploaded release asset is empty: {asset['name']}")
+          print("All four release assets are present and non-empty.")
+          PY
+
+      - name: Publish release
+        env:
+          RELEASE_ID: ${{ steps.draft.outputs.release_id }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh api --method PATCH "repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}" \
+            -F draft=false \
+            --jq '.html_url'

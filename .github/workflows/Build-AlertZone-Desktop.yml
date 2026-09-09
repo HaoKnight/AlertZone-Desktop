@@ -1,0 +1,307 @@
+name: Build AlertZone Desktop
+
+run-name: "Build AlertZone Desktop #${{ github.run_number }}"
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      max-parallel: 3
+      matrix:
+        include:
+          - name: Windows x64
+            runner: windows-latest
+            os: windows
+            python_arch: x64
+            expected_arch: x64
+            public_arch: x64
+          - name: macOS Apple Silicon
+            runner: macos-15
+            os: macos
+            python_arch: arm64
+            expected_arch: arm64
+            public_arch: arm64
+          - name: macOS Intel
+            runner: macos-15-intel
+            os: macos
+            python_arch: x64
+            expected_arch: x64
+            public_arch: x64
+
+    defaults:
+      run:
+        working-directory: AlertZone Desktop
+
+    env:
+      PYTHONUTF8: "1"
+      PYTHONIOENCODING: utf-8
+      PYTHONUNBUFFERED: "1"
+      QT_QPA_PLATFORM: offscreen
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v6
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+          architecture: ${{ matrix.python_arch }}
+          cache: pip
+          cache-dependency-path: |
+            AlertZone Desktop/requirements.txt
+            AlertZone Desktop/requirements-build.txt
+
+      - name: Verify native architecture
+        shell: bash
+        env:
+          EXPECTED_ARCH: ${{ matrix.expected_arch }}
+        run: |
+          python - <<'PY'
+          import os
+          import platform
+
+          aliases = {
+              "amd64": "x64",
+              "x86_64": "x64",
+              "arm64": "arm64",
+              "aarch64": "arm64",
+          }
+          machine = platform.machine().lower()
+          actual = aliases.get(machine, machine)
+          expected = os.environ["EXPECTED_ARCH"]
+          if actual != expected:
+              raise SystemExit(
+                  f"Runner/Python architecture mismatch: expected {expected}, "
+                  f"got {machine}"
+              )
+          print(f"Native build architecture: {machine} ({actual})")
+          PY
+
+      - name: Read and validate version
+        id: version
+        shell: bash
+        run: |
+          python - <<'PY'
+          import ast
+          import os
+          import re
+          from pathlib import Path
+
+          version_files = (
+              Path("build.py"),
+              Path("src/AlertZone_Desktop.py"),
+          )
+          versions = {}
+          for path in version_files:
+              tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+              for statement in tree.body:
+                  if not isinstance(statement, (ast.Assign, ast.AnnAssign)):
+                      continue
+                  targets = (
+                      statement.targets
+                      if isinstance(statement, ast.Assign)
+                      else [statement.target]
+                  )
+                  if any(
+                      isinstance(target, ast.Name) and target.id == "APP_VERSION"
+                      for target in targets
+                  ):
+                      versions[str(path)] = ast.literal_eval(statement.value)
+                      break
+              else:
+                  raise SystemExit(f"APP_VERSION is missing from {path}")
+
+          unique_versions = set(versions.values())
+          if len(unique_versions) != 1:
+              details = ", ".join(
+                  f"{path}={version!r}" for path, version in versions.items()
+              )
+              raise SystemExit(f"APP_VERSION mismatch: {details}")
+
+          version = unique_versions.pop()
+          if not isinstance(version, str) or not re.fullmatch(r"\d+\.\d+\.\d+", version):
+              raise SystemExit(f"Invalid semantic version: {version!r}")
+
+          with Path(os.environ["GITHUB_OUTPUT"]).open("a", encoding="utf-8") as output:
+              output.write(f"version={version}\n")
+          print(f"AlertZone Desktop version: {version}")
+          PY
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements-build.txt
+          python -m pip check
+
+      - name: Run tests
+        run: python -m unittest discover -s tests -v
+
+      - name: Build Windows portable executable
+        if: matrix.os == 'windows'
+        run: python build.py --onefile
+
+      - name: Create Windows portable and setup artifacts
+        if: matrix.os == 'windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $version = '${{ steps.version.outputs.version }}'
+          $artifactDir = Join-Path $PWD 'artifacts'
+          $sourceExe = Join-Path $PWD 'dist\AlertZone Desktop.exe'
+          $portableExe = Join-Path $artifactDir "AlertZone Desktop_${version}_x64-portable.exe"
+          $setupExe = Join-Path $artifactDir "AlertZone Desktop_${version}_x64-setup.exe"
+          $iconPath = Join-Path $PWD 'icon\icon.ico'
+
+          if (-not (Test-Path -LiteralPath $sourceExe -PathType Leaf)) {
+            throw "PyInstaller output not found: $sourceExe"
+          }
+          New-Item -ItemType Directory -Path $artifactDir -Force | Out-Null
+          Copy-Item -LiteralPath $sourceExe -Destination $portableExe -Force
+
+          $iscc = Get-Command 'ISCC.exe' -ErrorAction SilentlyContinue
+          if ($iscc) {
+            $isccPath = $iscc.Source
+          } else {
+            $isccPath = Join-Path ${env:ProgramFiles(x86)} 'Inno Setup 6\ISCC.exe'
+          }
+          if (-not (Test-Path -LiteralPath $isccPath -PathType Leaf)) {
+            throw "Inno Setup compiler not found: $isccPath"
+          }
+
+          $issPath = Join-Path $artifactDir 'AlertZone-Desktop.iss'
+          @"
+          #define MyAppName "AlertZone Desktop"
+          #define MyAppVersion "$version"
+          #define MyAppPublisher "H-Knight"
+          #define MyAppExeName "AlertZone Desktop.exe"
+
+          [Setup]
+          AppId={{2E660618-F12D-4B64-9F51-D46F78D15DA0}
+          AppName={#MyAppName}
+          AppVersion={#MyAppVersion}
+          AppPublisher={#MyAppPublisher}
+          DefaultDirName={localappdata}\Programs\{#MyAppName}
+          DefaultGroupName={#MyAppName}
+          DisableProgramGroupPage=yes
+          OutputDir=$artifactDir
+          OutputBaseFilename=AlertZone Desktop_${version}_x64-setup
+          SetupIconFile=$iconPath
+          Compression=lzma2
+          SolidCompression=yes
+          WizardStyle=modern
+          PrivilegesRequired=lowest
+          ArchitecturesAllowed=x64compatible
+          ArchitecturesInstallIn64BitMode=x64compatible
+          UninstallDisplayIcon={app}\{#MyAppExeName}
+
+          [Tasks]
+          Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"; Flags: unchecked
+
+          [Files]
+          Source: "$sourceExe"; DestDir: "{app}"; DestName: "{#MyAppExeName}"; Flags: ignoreversion
+
+          [Icons]
+          Name: "{autoprograms}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"
+          Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Tasks: desktopicon
+          "@ | Set-Content -LiteralPath $issPath -Encoding UTF8
+
+          & $isccPath $issPath
+          if ($LASTEXITCODE -ne 0) {
+            throw "Inno Setup failed with exit code $LASTEXITCODE"
+          }
+
+          foreach ($expected in @($portableExe, $setupExe)) {
+            if (-not (Test-Path -LiteralPath $expected -PathType Leaf)) {
+              throw "Expected Windows artifact not found: $expected"
+            }
+            if ((Get-Item -LiteralPath $expected).Length -eq 0) {
+              throw "Windows artifact is empty: $expected"
+            }
+          }
+
+      - name: Build macOS application
+        if: matrix.os == 'macos'
+        run: python build.py --onedir
+
+      - name: Create macOS DMG
+        if: matrix.os == 'macos'
+        shell: bash
+        env:
+          PUBLIC_ARCH: ${{ matrix.public_arch }}
+          EXPECTED_ARCH: ${{ matrix.expected_arch }}
+          APP_VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          app_path="dist/AlertZone Desktop.app"
+          app_executable="$app_path/Contents/MacOS/AlertZone Desktop"
+          output_dir="artifacts"
+          output_path="$output_dir/AlertZone Desktop_${APP_VERSION}_${PUBLIC_ARCH}.dmg"
+
+          test -d "$app_path"
+          test -x "$app_executable"
+          /usr/bin/codesign --verify --deep --strict "$app_path"
+
+          architectures="$(/usr/bin/lipo -archs "$app_executable")"
+          case "$EXPECTED_ARCH" in
+            arm64) required_arch="arm64" ;;
+            x64) required_arch="x86_64" ;;
+            *) echo "Unsupported expected architecture: $EXPECTED_ARCH" >&2; exit 1 ;;
+          esac
+          if [[ " $architectures " != *" $required_arch "* ]]; then
+            echo "Application architecture mismatch: expected $required_arch, got $architectures" >&2
+            exit 1
+          fi
+
+          mkdir -p "$output_dir"
+          dmg_root="$(mktemp -d "$RUNNER_TEMP/alertzone-desktop-dmg.XXXXXX")"
+          cp -R "$app_path" "$dmg_root/"
+          ln -s /Applications "$dmg_root/Applications"
+          hdiutil create \
+            -quiet \
+            -volname "AlertZone Desktop $APP_VERSION" \
+            -srcfolder "$dmg_root" \
+            -format UDZO \
+            -ov \
+            "$output_path"
+          hdiutil verify "$output_path"
+          test -s "$output_path"
+
+      - name: Upload Windows setup artifact
+        if: matrix.os == 'windows'
+        uses: actions/upload-artifact@v7
+        with:
+          name: AlertZone Desktop_${{ steps.version.outputs.version }}_x64-setup.exe
+          path: AlertZone Desktop/artifacts/AlertZone Desktop_${{ steps.version.outputs.version }}_x64-setup.exe
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0
+
+      - name: Upload Windows portable artifact
+        if: matrix.os == 'windows'
+        uses: actions/upload-artifact@v7
+        with:
+          name: AlertZone Desktop_${{ steps.version.outputs.version }}_x64-portable.exe
+          path: AlertZone Desktop/artifacts/AlertZone Desktop_${{ steps.version.outputs.version }}_x64-portable.exe
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0
+
+      - name: Upload macOS DMG artifact
+        if: matrix.os == 'macos'
+        uses: actions/upload-artifact@v7
+        with:
+          name: AlertZone Desktop_${{ steps.version.outputs.version }}_${{ matrix.public_arch }}.dmg
+          path: AlertZone Desktop/artifacts/AlertZone Desktop_${{ steps.version.outputs.version }}_${{ matrix.public_arch }}.dmg
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0
