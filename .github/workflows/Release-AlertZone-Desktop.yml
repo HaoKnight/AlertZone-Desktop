@@ -445,7 +445,7 @@ jobs:
             "release-assets/macos-arm64/AlertZone Desktop_${VERSION}_arm64.dmg#AlertZone Desktop_${VERSION}_arm64.dmg" \
             "release-assets/macos-x64/AlertZone Desktop_${VERSION}_x64.dmg#AlertZone Desktop_${VERSION}_x64.dmg"
 
-      - name: Confirm uploaded assets and render release notes with actual download URLs
+      - name: Confirm uploaded assets and render release notes with tagged download URLs
         env:
           VERSION: ${{ steps.version.outputs.version }}
           RELEASE_ID: ${{ steps.draft.outputs.release_id }}
@@ -461,9 +461,10 @@ jobs:
           import os
           import sys
           from pathlib import Path
-          from urllib.parse import urlsplit
+          from urllib.parse import quote
 
           version = os.environ["VERSION"]
+          tag = f"v{version}"
           uploaded_filenames = {
               f"AlertZone Desktop_{version}_x64-setup.exe",
               f"AlertZone Desktop_{version}_x64-portable.exe",
@@ -476,6 +477,10 @@ jobs:
           expected = {filename.replace(" ", ".") for filename in uploaded_filenames}
           with open(sys.argv[1], encoding="utf-8") as file:
               release = json.load(file)
+          if release.get("tag_name") != tag:
+              raise SystemExit(
+                  f"Unexpected release tag: {release.get('tag_name')!r}; expected {tag!r}"
+              )
           assets = release.get("assets")
           names = [asset.get("name") for asset in assets] if isinstance(assets, list) else []
           if len(assets or []) != 4 or set(names) != expected or len(set(names)) != 4:
@@ -497,14 +502,17 @@ jobs:
           }
           assets_by_name = {asset["name"]: asset for asset in assets}
           notes = Path("release_notes.md").read_text(encoding="utf-8")
+          # Draft browser_download_url values may contain an untagged-* alias.
+          # Build public URLs from the final tag and GitHub's actual asset names
+          # before publishing the body and draft=false in the same request.
+          download_base = (
+              f"{os.environ['GITHUB_SERVER_URL'].rstrip('/')}/"
+              f"{os.environ['GITHUB_REPOSITORY']}/releases/download/"
+              f"{quote(tag, safe='')}"
+          )
           for placeholder, filename in filenames.items():
               asset = assets_by_name[filename.replace(" ", ".")]
-              url = asset.get("browser_download_url")
-              if not isinstance(url, str):
-                  raise SystemExit(f"Missing download URL for {asset['name']}")
-              parsed = urlsplit(url)
-              if parsed.scheme != "https" or not parsed.netloc:
-                  raise SystemExit(f"Invalid download URL for {asset['name']}: {url!r}")
+              url = f"{download_base}/{quote(asset['name'], safe='')}"
               notes = notes.replace("{{" + placeholder + "}}", url)
 
           payload_path = Path(os.environ["RUNNER_TEMP"]) / "alertzone-desktop-publish.json"
@@ -512,7 +520,7 @@ jobs:
               json.dumps({"body": notes, "draft": False}, ensure_ascii=False),
               encoding="utf-8",
           )
-          print("Rendered release notes using the four uploaded assets' download URLs.")
+          print(f"Rendered release notes using final tag {tag} and uploaded asset names.")
           PY
 
       - name: Publish release
