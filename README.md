@@ -5,7 +5,7 @@
     <p>局域网前端 · 后台告警 · 原生弹窗通知</p>
 </div>
 
-AlertZone Desktop 是 AlertZone 的原生桌面客户端，通过局域网连接 AlertZone Server，
+AlertZone Desktop 是 AlertZone Server的桌面客户端，通过局域网连接 AlertZone Server，
 查看监测画面并接收告警。摄像头与人物检测由 Server 负责，Desktop 无需安装 YOLO。
 
 ## ✨ 功能
