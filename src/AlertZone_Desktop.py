@@ -101,7 +101,7 @@ except ImportError:
     objc = None
 
 APP_NAME = "AlertZone Desktop"
-APP_VERSION = "1.2.2"
+APP_VERSION = "1.2.3"
 WINDOW_TITLE = f"{APP_NAME} {APP_VERSION} · ©H-Knight"
 ORGANIZATION_NAME = "AlertZone"
 SINGLE_INSTANCE_SERVER_NAME = "com.hknight.alertzone.desktop.instance"
@@ -284,6 +284,9 @@ class NativeMacMenuAction:
     def setText(self, text: str) -> None:
         self._menu_item.setTitle_(text)
 
+    def setEnabled(self, enabled: bool) -> None:
+        self._menu_item.setEnabled_(enabled)
+
 
 if AppKit is not None and objc is not None:
 
@@ -315,6 +318,17 @@ if AppKit is not None and objc is not None:
         @objc.IBAction
         def openAlertSettings_(self, _sender: Any) -> None:
             QTimer.singleShot(0, self._window.open_alert_settings)
+
+        @objc.IBAction
+        def toggleSound_(self, _sender: Any) -> None:
+            enabled = str(
+                self._window._settings.value("sound/mode", "default")
+            ) != "off"
+            self._window._on_tray_sound_toggled(not enabled)
+
+        @objc.IBAction
+        def openPopupSettings_(self, _sender: Any) -> None:
+            QTimer.singleShot(0, self._window._popup.show_placement_preview)
 
         @objc.IBAction
         def openOtherSettings_(self, _sender: Any) -> None:
@@ -413,6 +427,13 @@ class NativeMacTrayIcon:
             else AppKit.NSControlStateValueOff
         )
         self.alert_action = NativeMacMenuAction(alert_item)
+        self.sound_action = NativeMacMenuAction(
+            self._add_action("启用声音", "toggleSound:")
+        )
+        self._menu.addItem_(AppKit.NSMenuItem.separatorItem())
+        self.popup_action = NativeMacMenuAction(
+            self._add_action("弹窗位置", "openPopupSettings:")
+        )
         self._add_action("告警设置", "openAlertSettings:")
         self._add_action("其他配置", "openOtherSettings:")
         self._menu.addItem_(AppKit.NSMenuItem.separatorItem())
@@ -2725,7 +2746,12 @@ class SoundSettingsSection(QFrame):
                 "请先选择一个存在的声音文件。",
             )
             return False
-        self._settings.setValue("sound/mode", self.sound_mode.currentData())
+        mode = str(self.sound_mode.currentData())
+        previous_mode = str(self._settings.value("sound/mode", "default"))
+        remembered_mode = mode if mode != "off" else previous_mode
+        if remembered_mode != "off":
+            self._settings.setValue("sound/last_enabled_mode", remembered_mode)
+        self._settings.setValue("sound/mode", mode)
         self._settings.setValue("sound/custom_path", path)
         self._settings.setValue("sound/volume", self.volume.value())
         self._settings.sync()
@@ -4243,6 +4269,8 @@ class MainWindow(QMainWindow):
         self._tray_menu: QMenu | None = None
         self._tray_alert_action: Any | None = None
         self._tray_status_action: Any | None = None
+        self._tray_sound_action: Any | None = None
+        self._tray_popup_action: Any | None = None
         if sys.platform == "darwin":
             # macOS 只使用 Cocoa 状态栏，绝不静默回退到 Qt QMenu。
             # 依赖缺失时保持主窗口可用，并由 hide_to_tray 阻止窗口失联。
@@ -4250,6 +4278,9 @@ class MainWindow(QMainWindow):
                 tray = NativeMacTrayIcon(self)
                 self._tray_status_action = tray.status_action
                 self._tray_alert_action = tray.alert_action
+                self._tray_sound_action = tray.sound_action
+                self._tray_popup_action = tray.popup_action
+                self._sync_tray_sound_actions()
                 self._tray = tray
             return
         if not QSystemTrayIcon.isSystemTrayAvailable():
@@ -4267,6 +4298,17 @@ class MainWindow(QMainWindow):
         self._tray_alert_action.setChecked(self._alert_enabled())
         self._tray_alert_action.toggled.connect(
             self._on_tray_alert_toggled
+        )
+        self._tray_sound_action = menu.addAction("启用声音")
+        self._tray_sound_action.setCheckable(True)
+        self._tray_sound_action.toggled.connect(
+            self._on_tray_sound_toggled
+        )
+        self._sync_tray_sound_actions()
+        menu.addSeparator()
+        self._tray_popup_action = menu.addAction("弹窗位置")
+        self._tray_popup_action.triggered.connect(
+            self._popup.show_placement_preview
         )
         alert_settings_action = menu.addAction("告警设置")
         alert_settings_action.triggered.connect(self.open_alert_settings)
@@ -4419,6 +4461,7 @@ class MainWindow(QMainWindow):
         dialog.activateWindow()
 
     def _on_alert_settings_changed(self) -> None:
+        self._sync_tray_sound_actions()
         self._popup.sync_alert_title()
         self._dashboard.sync_alert_title()
         self._on_alert_display_mode_changed(
@@ -4451,6 +4494,40 @@ class MainWindow(QMainWindow):
         if self._dashboard.alert_enabled_button.isChecked() != enabled:
             self._dashboard.alert_enabled_button.setChecked(enabled)
 
+    def _sync_tray_sound_actions(self) -> None:
+        enabled = str(self._settings.value("sound/mode", "default")) != "off"
+        action = getattr(self, "_tray_sound_action", None)
+        if action is not None:
+            action.blockSignals(True)
+            action.setChecked(enabled)
+            action.blockSignals(False)
+
+    def _on_tray_sound_toggled(self, enabled: bool) -> None:
+        """托盘静音不丢失声音类型，并同步已打开的告警设置。"""
+        current_mode = str(self._settings.value("sound/mode", "default"))
+        if enabled:
+            mode = current_mode
+            if mode == "off":
+                mode = str(
+                    self._settings.value("sound/last_enabled_mode", "default")
+                )
+                if mode not in {"default", "app-default", "custom"}:
+                    mode = "default"
+        else:
+            if current_mode != "off":
+                self._settings.setValue("sound/last_enabled_mode", current_mode)
+            mode = "off"
+        self._settings.setValue("sound/mode", mode)
+        self._settings.sync()
+        dialog = getattr(self, "_alert_settings_dialog", None)
+        if dialog is not None:
+            combo = dialog.sound_settings.sound_mode
+            combo.setCurrentIndex(max(combo.findData(mode), 0))
+        self._sync_tray_sound_actions()
+        if not enabled:
+            self._stop_sound()
+        self._sync_alert_sound()
+
     def _on_continuous_monitoring_changed(self, enabled: bool) -> None:
         """连续监测开启后，让告警界面从当前时刻开始重新布防。"""
         if not enabled:
@@ -4468,6 +4545,9 @@ class MainWindow(QMainWindow):
         self._settings.sync()
         self._popup.set_display_mode(mode)
         self._dashboard.set_alert_display_mode(mode)
+        popup_action = getattr(self, "_tray_popup_action", None)
+        if popup_action is not None:
+            popup_action.setEnabled(mode != "sound-only")
         if not self._alert_active:
             return
         self._sync_alert_surface()
@@ -5002,14 +5082,6 @@ class MainWindow(QMainWindow):
         self._set_background_mode(True)
         self._dashboard.set_view_active(False)
         self.hide()
-        if not setting_bool(self._settings, "tray/hint_shown", False):
-            self._tray.showMessage(
-                APP_NAME,
-                "程序正在后台运行；检测到报警时只会显示报警小窗。",
-                QSystemTrayIcon.MessageIcon.Information,
-                3500,
-            )
-            self._settings.setValue("tray/hint_shown", True)
 
     def show_main_window(self) -> None:
         self._set_background_mode(False)
@@ -5078,29 +5150,8 @@ class MainWindow(QMainWindow):
             event.accept()
             return
 
-        dialog = CloseActionDialog(
-            self,
-            self._current_theme == "dark",
-            self._icon,
-        )
-        dialog.exec()
-        if dialog.selected_action == "background":
-            if self._tray is None:
-                QMessageBox.information(
-                    self,
-                    "无法后台运行",
-                    "当前系统未提供托盘区域，主窗口将保持打开。",
-                )
-                event.ignore()
-                return
-            event.ignore()
-            self.hide_to_tray()
-            return
-        if dialog.selected_action == "exit":
-            event.accept()
-            self.quit_application()
-            return
         event.ignore()
+        self.hide_to_tray()
 
     def _apply_theme(self, theme: str) -> None:
         """统一应用到主窗口、连接页、设置页、工具栏和报警小窗。"""

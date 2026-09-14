@@ -7,13 +7,13 @@ import tempfile
 import threading
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtCore import QEvent, QPointF, QSettings, QSize, Qt, QTimer
 from PySide6.QtTest import QTest
-from PySide6.QtGui import QIcon, QMouseEvent, QPixmap
+from PySide6.QtGui import QCloseEvent, QIcon, QMouseEvent, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
     QLabel,
@@ -88,9 +88,9 @@ class NativeDashboardTests(unittest.TestCase):
     def test_main_window_title_uses_server_credit(self) -> None:
         self.assertEqual(
             WINDOW_TITLE,
-            "AlertZone Desktop 1.2.2 · ©H-Knight",
+            "AlertZone Desktop 1.2.3 · ©H-Knight",
         )
-        self.assertEqual(APP_VERSION, "1.2.2")
+        self.assertEqual(APP_VERSION, "1.2.3")
 
     def test_connection_page_cancel_button_emits_request(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -151,6 +151,109 @@ class NativeDashboardTests(unittest.TestCase):
             self.assertTrue(
                 fake_main_window._tray_alert_action.checked
             )
+
+    def test_tray_sound_switch_restores_mode_and_syncs_open_dialog(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings = QSettings(
+                f"{temp_dir}/settings.ini", QSettings.Format.IniFormat
+            )
+            settings.setValue("sound/mode", "custom")
+            settings.setValue("sound/custom_path", "/example/alarm.wav")
+            settings.setValue("sound/volume", 60)
+            dialog = AlertSettingsDialog(settings)
+
+            class FakeAction:
+                checked = False
+
+                def blockSignals(self, _blocked: bool) -> None:
+                    pass
+
+                def setChecked(self, checked: bool) -> None:
+                    self.checked = checked
+
+            class FakeWindow:
+                _settings = settings
+                _alert_settings_dialog = dialog
+                _tray_sound_action = FakeAction()
+                _sync_tray_sound_actions = MainWindow._sync_tray_sound_actions
+                stopped = 0
+                synced = 0
+
+                def _stop_sound(self) -> None:
+                    self.stopped += 1
+
+                def _sync_alert_sound(self) -> None:
+                    self.synced += 1
+
+            window = FakeWindow()
+            MainWindow._on_tray_sound_toggled(window, False)
+            MainWindow._on_tray_sound_toggled(window, False)
+            self.assertEqual(settings.value("sound/mode"), "off")
+            self.assertEqual(settings.value("sound/last_enabled_mode"), "custom")
+            self.assertEqual(dialog.sound_settings.sound_mode.currentData(), "off")
+            self.assertFalse(window._tray_sound_action.checked)
+            self.assertEqual(window.stopped, 2)
+
+            MainWindow._on_tray_sound_toggled(window, True)
+            self.assertEqual(settings.value("sound/mode"), "custom")
+            self.assertEqual(dialog.sound_settings.sound_mode.currentData(), "custom")
+            self.assertTrue(window._tray_sound_action.checked)
+            self.assertEqual(settings.value("sound/custom_path"), "/example/alarm.wav")
+            self.assertEqual(settings.value("sound/volume", type=int), 60)
+            self.assertEqual(window.synced, 3)
+
+    def test_qt_tray_menu_has_sound_and_popup_actions(self) -> None:
+        class FakeWindow(QWidget):
+            _icon = QIcon()
+            calls = []
+            _popup = type("Popup", (), {
+                "show_placement_preview": lambda self: FakeWindow.calls.append("popup")
+            })()
+
+            def _alert_enabled(self):
+                return True
+
+            def show_main_window(self):
+                pass
+
+            def _on_tray_alert_toggled(self, _enabled):
+                pass
+
+            def _on_tray_sound_toggled(self, enabled):
+                self.calls.append(enabled)
+
+            def _sync_tray_sound_actions(self):
+                pass
+
+            open_alert_settings = show_main_window
+            open_other_settings = show_main_window
+            quit_application = show_main_window
+            _tray_activated = show_main_window
+
+        window = FakeWindow()
+        with patch("src.AlertZone_Desktop.sys.platform", "linux"), patch(
+            "src.AlertZone_Desktop.QSystemTrayIcon.isSystemTrayAvailable",
+            return_value=True,
+        ):
+            MainWindow._build_tray(window)
+        actions = {action.text(): action for action in window._tray_menu.actions()}
+        self.assertNotIn("开启声音", actions)
+        self.assertNotIn("关闭声音", actions)
+        self.assertIn("启用声音", actions)
+        self.assertTrue(actions["启用声音"].isCheckable())
+        menu_actions = window._tray_menu.actions()
+        sound_index = menu_actions.index(actions["启用声音"])
+        self.assertTrue(menu_actions[sound_index + 1].isSeparator())
+        self.assertEqual(menu_actions[sound_index + 2].text(), "弹窗位置")
+        actions["启用声音"].trigger()
+        self.assertTrue(actions["启用声音"].isChecked())
+        actions["启用声音"].trigger()
+        self.assertFalse(actions["启用声音"].isChecked())
+        self.assertIn("弹窗位置", actions)
+        actions["弹窗位置"].trigger()
+        self.assertEqual(window.calls, [True, False, "popup"])
+        window._tray.hide()
+        window.deleteLater()
 
     def test_tray_left_and_right_click_open_menu(self) -> None:
         class FakeMenu:
@@ -218,38 +321,51 @@ class NativeDashboardTests(unittest.TestCase):
         stack.setCurrentWidget(compact_page)
         self.assertEqual(stack.minimumSizeHint().width(), 240)
 
-    def test_close_dialog_offers_server_style_actions(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            settings = QSettings(
-                f"{temp_dir}/settings.ini", QSettings.Format.IniFormat
-            )
-            parent = NativeDashboard(settings)
-            source_pixmap = QPixmap(256, 256)
-            source_pixmap.fill(Qt.GlobalColor.blue)
-            dialog = CloseActionDialog(
-                parent,
-                False,
-                QIcon(source_pixmap),
-            )
-            background_button = dialog.findChild(
-                QPushButton, "closeBackgroundButton"
-            )
-            exit_button = dialog.findChild(QPushButton, "closeExitButton")
-            cancel_button = dialog.findChild(
-                QPushButton, "closeCancelButton"
-            )
-            icon_label = dialog.findChild(QLabel, "closeDialogIcon")
-            self.assertEqual(background_button.text(), "后台静默运行")
-            self.assertEqual(exit_button.text(), "退出应用程序")
-            self.assertEqual(cancel_button.text(), "取消")
-            self.assertEqual(icon_label.width(), 60)
-            self.assertEqual(icon_label.height(), 60)
-            self.assertGreaterEqual(
-                icon_label.pixmap().deviceIndependentSize().width(),
-                56,
-            )
-            background_button.click()
-            self.assertEqual(dialog.selected_action, "background")
+    def test_close_window_defaults_to_background_without_dialog(self) -> None:
+        window = Mock()
+        window._quitting = False
+        event = QCloseEvent()
+        with patch("src.AlertZone_Desktop.CloseActionDialog") as dialog:
+            MainWindow.closeEvent(window, event)
+        self.assertFalse(event.isAccepted())
+        window._settings.sync.assert_called_once_with()
+        window.hide_to_tray.assert_called_once_with()
+        window.quit_application.assert_not_called()
+        dialog.assert_not_called()
+
+    def test_close_window_accepts_explicit_quit(self) -> None:
+        window = Mock()
+        window._quitting = True
+        event = QCloseEvent()
+        MainWindow.closeEvent(window, event)
+        self.assertTrue(event.isAccepted())
+        window.hide_to_tray.assert_not_called()
+
+    def test_background_mode_hides_window_without_notification(self) -> None:
+        window = Mock()
+        with patch("src.AlertZone_Desktop.QMessageBox.information") as message:
+            MainWindow.hide_to_tray(window)
+        window._set_background_mode.assert_called_once_with(True)
+        window._dashboard.set_view_active.assert_called_once_with(False)
+        window.hide.assert_called_once_with()
+        window._tray.showMessage.assert_not_called()
+        message.assert_not_called()
+
+    def test_close_window_keeps_access_when_tray_unavailable(self) -> None:
+        window = QWidget()
+        window._settings = Mock()
+        window._tray = None
+        window._quitting = False
+        window.hide_to_tray = lambda: MainWindow.hide_to_tray(window)
+        event = QCloseEvent()
+        window.show()
+        with patch("src.AlertZone_Desktop.QMessageBox.information") as message:
+            MainWindow.closeEvent(window, event)
+        self.assertFalse(event.isAccepted())
+        self.assertTrue(window.isVisible())
+        message.assert_called_once()
+        window.hide()
+        window.deleteLater()
 
     def test_background_mode_respects_alert_switch(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

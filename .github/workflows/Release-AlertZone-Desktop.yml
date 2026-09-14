@@ -76,7 +76,17 @@ jobs:
                   "The requested run is not from "
                   f"{os.environ['EXPECTED_WORKFLOW_PATH']}: {run.get('path')!r}"
               )
-          if run.get("status") != "completed" or run.get("conclusion") != "success":
+          # In Build + Release, this release job runs after needs: build succeeds,
+          # while the enclosing run itself is still in progress.
+          is_current_combined_run = (
+              str(run.get("id")) == os.environ["GITHUB_RUN_ID"]
+              and os.environ["EXPECTED_WORKFLOW_PATH"]
+              == ".github/workflows/Build+Release-AlertZone-Desktop.yml"
+              and run.get("status") == "in_progress"
+          )
+          if not is_current_combined_run and (
+              run.get("status") != "completed" or run.get("conclusion") != "success"
+          ):
               errors.append(
                   "The requested build run must be completed successfully; "
                   f"got status={run.get('status')!r}, "
@@ -151,6 +161,44 @@ jobs:
           with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
               output.write(f"version={version}\n")
           print(f"AlertZone Desktop version at build commit: {version}")
+          PY
+
+      - name: Validate release notes from the build commit
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import os
+          import re
+          from pathlib import Path
+
+          path = Path("release_notes.md")
+          if not path.is_file() or not path.read_text(encoding="utf-8").strip():
+              raise SystemExit("release_notes.md is missing or empty in the build commit.")
+          notes = path.read_text(encoding="utf-8")
+          expected_heading = f"## v{os.environ['VERSION']}"
+          version_headings = re.findall(r"^## v[^\r\n]+", notes, re.MULTILINE)
+          if version_headings != [expected_heading]:
+              raise SystemExit(
+                  f"release_notes.md must describe only {expected_heading!r}; "
+                  f"got {version_headings!r}."
+              )
+          required = {
+              "{{WINDOWS_X64_URL}}",
+              "{{WINDOWS_X64_PORTABLE_URL}}",
+              "{{MACOS_ARM64_URL}}",
+              "{{MACOS_X64_URL}}",
+          }
+          placeholders = set(re.findall(r"\{\{[^{}]*\}\}", notes))
+          if placeholders != required:
+              raise SystemExit(
+                  "release_notes.md download placeholders do not match: "
+                  f"missing={sorted(required - placeholders)!r}, "
+                  f"unknown={sorted(placeholders - required)!r}."
+              )
+          print(f"Validated release notes for v{os.environ['VERSION']}.")
           PY
 
       - name: Refuse an existing tag or release
@@ -348,7 +396,6 @@ jobs:
             -f target_commitish="$BUILD_SHA" \
             -f name="AlertZone Desktop v${VERSION}" \
             -F draft=true \
-            -F generate_release_notes=true \
             > "$release_json"
 
           python3 - "$release_json" <<'PY'
@@ -398,7 +445,7 @@ jobs:
             "release-assets/macos-arm64/AlertZone Desktop_${VERSION}_arm64.dmg#AlertZone Desktop_${VERSION}_arm64.dmg" \
             "release-assets/macos-x64/AlertZone Desktop_${VERSION}_x64.dmg#AlertZone Desktop_${VERSION}_x64.dmg"
 
-      - name: Confirm all release assets uploaded
+      - name: Confirm uploaded assets and render release notes with actual download URLs
         env:
           VERSION: ${{ steps.version.outputs.version }}
           RELEASE_ID: ${{ steps.draft.outputs.release_id }}
@@ -413,6 +460,8 @@ jobs:
           import json
           import os
           import sys
+          from pathlib import Path
+          from urllib.parse import urlsplit
 
           version = os.environ["VERSION"]
           uploaded_filenames = {
@@ -439,6 +488,31 @@ jobs:
               if not isinstance(asset.get("size"), int) or asset["size"] <= 0:
                   raise SystemExit(f"Uploaded release asset is empty: {asset['name']}")
           print("All four release assets are present and non-empty.")
+
+          filenames = {
+              "WINDOWS_X64_URL": f"AlertZone Desktop_{version}_x64-setup.exe",
+              "WINDOWS_X64_PORTABLE_URL": f"AlertZone Desktop_{version}_x64-portable.exe",
+              "MACOS_ARM64_URL": f"AlertZone Desktop_{version}_arm64.dmg",
+              "MACOS_X64_URL": f"AlertZone Desktop_{version}_x64.dmg",
+          }
+          assets_by_name = {asset["name"]: asset for asset in assets}
+          notes = Path("release_notes.md").read_text(encoding="utf-8")
+          for placeholder, filename in filenames.items():
+              asset = assets_by_name[filename.replace(" ", ".")]
+              url = asset.get("browser_download_url")
+              if not isinstance(url, str):
+                  raise SystemExit(f"Missing download URL for {asset['name']}")
+              parsed = urlsplit(url)
+              if parsed.scheme != "https" or not parsed.netloc:
+                  raise SystemExit(f"Invalid download URL for {asset['name']}: {url!r}")
+              notes = notes.replace("{{" + placeholder + "}}", url)
+
+          payload_path = Path(os.environ["RUNNER_TEMP"]) / "alertzone-desktop-publish.json"
+          payload_path.write_text(
+              json.dumps({"body": notes, "draft": False}, ensure_ascii=False),
+              encoding="utf-8",
+          )
+          print("Rendered release notes using the four uploaded assets' download URLs.")
           PY
 
       - name: Publish release
@@ -448,5 +522,5 @@ jobs:
         run: |
           set -euo pipefail
           gh api --method PATCH "repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}" \
-            -F draft=false \
+            --input "$RUNNER_TEMP/alertzone-desktop-publish.json" \
             --jq '.html_url'
