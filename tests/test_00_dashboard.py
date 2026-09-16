@@ -1901,8 +1901,16 @@ class NativeDashboardTests(unittest.TestCase):
 
         dialog = OtherSettingsDialog()
         self.assertEqual(dialog.windowTitle(), "关于软件")
+        assets = [
+            {"name": "AlertZone.Desktop_99.0.0_arm64.dmg", "browser_download_url": "https://example.com/mac-arm.dmg"},
+            {"name": "AlertZone.Desktop_99.0.0_x64.dmg", "browser_download_url": "https://example.com/mac-x64.dmg"},
+            {"name": "AlertZone.Desktop_99.0.0_x64-setup.exe", "browser_download_url": "https://example.com/win-x64.exe"},
+            {"name": "AlertZone.Desktop_99.0.0_arm64-setup.exe", "browser_download_url": "https://example.com/win-arm.exe"},
+            {"name": "AlertZone.Desktop_99.0.0_x86_64.AppImage", "browser_download_url": "https://example.com/linux-x64.AppImage"},
+            {"name": "AlertZone.Desktop_99.0.0_arm64.AppImage", "browser_download_url": "https://example.com/linux-arm.AppImage"},
+        ]
         cases = [
-            (200, {"tag_name": "v99.0.0"}, "发现新版本", True),
+            (200, {"tag_name": "v99.0.0", "assets": assets}, "发现新版本", True),
             (200, {"tag_name": f"v{APP_VERSION}"}, "已是最新版本", False),
             (200, {"tag_name": "v0.0.1"}, "高于最新正式版", False),
             (200, {"tag_name": "invalid"}, "无法读取", False),
@@ -1916,13 +1924,59 @@ class NativeDashboardTests(unittest.TestCase):
                 reply.attribute.return_value = status
                 reply.error.return_value = QNetworkReply.NetworkError.NoError
                 reply.readAll.return_value = json.dumps(payload).encode()
-                dialog._download_button.hide()
+                dialog._download_available = False
+                dialog._check_update_button.setText("检查更新")
+                dialog._check_update_button.setStyleSheet("")
                 dialog._update_reply = reply
                 dialog._finish_update(reply)
                 self.assertIn(expected, dialog._update_status.text())
-                self.assertEqual(not dialog._download_button.isHidden(), download)
+                self.assertEqual(dialog._download_available, download)
+                self.assertEqual(
+                    dialog._check_update_button.text(),
+                    "下载新版更新" if download else "检查更新",
+                )
                 self.assertIsNone(dialog._update_reply)
                 reply.deleteLater.assert_called_once()
+        self.assertFalse(any(button.text() == "前往 GitHub 下载" for button in dialog.findChildren(QPushButton)))
+        self.assertEqual(
+            dialog._select_release_asset({"assets": assets}, "darwin", "arm64")[1],
+            "AlertZone.Desktop_99.0.0_arm64.dmg",
+        )
+        self.assertEqual(
+            dialog._select_release_asset({"assets": assets}, "win32", "AMD64")[1],
+            "AlertZone.Desktop_99.0.0_x64-setup.exe",
+        )
+        self.assertEqual(
+            dialog._select_release_asset({"assets": assets}, "linux", "x86_64")[1],
+            "AlertZone.Desktop_99.0.0_x86_64.AppImage",
+        )
+        dialog._download_available = True
+        with patch.object(dialog, "_download_update") as download_update:
+            dialog._handle_update_button()
+        download_update.assert_called_once_with()
+
+        from pathlib import Path
+        from PySide6.QtCore import QByteArray, QIODevice, QSaveFile
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            target = Path(temp_dir) / "AlertZone-update.dmg"
+            download_file = QSaveFile(str(target))
+            self.assertTrue(
+                download_file.open(QIODevice.OpenModeFlag.WriteOnly)
+            )
+            reply = Mock()
+            reply.readAll.return_value = QByteArray(b"installer-data")
+            reply.error.return_value = QNetworkReply.NetworkError.NoError
+            dialog._download_reply = reply
+            dialog._download_file = download_file
+            dialog._download_write_failed = False
+            dialog._finish_download(reply, target)
+            self.assertEqual(target.read_bytes(), b"installer-data")
+            self.assertIn("已下载到", dialog._update_status.text())
+            self.assertEqual(
+                dialog._check_update_button.text(), "重新下载"
+            )
+            reply.deleteLater.assert_called_once()
         self.assertGreater(dialog._version_tuple("v1.10.0"), dialog._version_tuple("1.9.9"))
         dialog.deleteLater()
 

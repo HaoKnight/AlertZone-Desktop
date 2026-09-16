@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import math
+import platform
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -25,6 +26,7 @@ from PySide6.QtCore import (
     QRect,
     QRectF,
     QLocale,
+    QSaveFile,
     QSettings,
     QSize,
     QStandardPaths,
@@ -2763,7 +2765,6 @@ class SoundSettingsSection(QFrame):
 class OtherSettingsDialog(QDialog):
     """软件版本、作者、GitHub 主页及手动检查更新。"""
 
-    RELEASES_URL = "https://github.com/HaoKnight/AlertZone-Desktop/releases/latest"
     UPDATE_API = "https://api.github.com/repos/HaoKnight/AlertZone-Desktop/releases/latest"
 
     def __init__(self, parent: QWidget | None = None) -> None:
@@ -2771,6 +2772,11 @@ class OtherSettingsDialog(QDialog):
         self.setWindowTitle("关于软件")
         self._network = QNetworkAccessManager(self)
         self._update_reply: QNetworkReply | None = None
+        self._download_reply: QNetworkReply | None = None
+        self._download_file: QSaveFile | None = None
+        self._download_write_failed = False
+        self._download_url = ""
+        self._download_name = ""
         card = QFrame()
         card.setObjectName("dialogCard")
         card_layout = QVBoxLayout(card)
@@ -2846,12 +2852,11 @@ class OtherSettingsDialog(QDialog):
         self._update_status.hide()
         card_layout.addWidget(self._update_status)
         self._check_update_button = QPushButton("检查更新")
-        self._check_update_button.clicked.connect(self._check_updates)
+        self._download_available = False
+        self._check_update_button.clicked.connect(
+            self._handle_update_button
+        )
         card_layout.addWidget(self._check_update_button)
-        self._download_button = QPushButton("前往 GitHub 下载")
-        self._download_button.clicked.connect(self._open_download)
-        self._download_button.hide()
-        card_layout.addWidget(self._download_button)
         layout = QVBoxLayout(self)
         layout.setContentsMargins(12, 14, 12, 12)
         layout.setSpacing(6)
@@ -2869,12 +2874,59 @@ class OtherSettingsDialog(QDialog):
             raise ValueError("无法识别发布版本号")
         return tuple(int(part) for part in parts)
 
+    @staticmethod
+    def _select_release_asset(
+        payload: dict[str, Any],
+        platform_name: str | None = None,
+        machine: str | None = None,
+    ) -> tuple[str, str] | None:
+        """选择适配当前系统和 CPU 的正式安装包。"""
+        system = platform_name or sys.platform
+        architecture = (machine or platform.machine()).lower()
+        assets = payload.get("assets")
+        if not isinstance(assets, list):
+            return None
+        valid_assets: list[tuple[str, str]] = []
+        for asset in assets:
+            if not isinstance(asset, dict):
+                continue
+            name = asset.get("name")
+            url = asset.get("browser_download_url")
+            if (
+                isinstance(name, str)
+                and isinstance(url, str)
+                and url.startswith("https://")
+            ):
+                valid_assets.append((name, url))
+
+        def find(*tokens: str) -> tuple[str, str] | None:
+            return next(
+                (
+                    (url, name)
+                    for name, url in valid_assets
+                    if all(token in name.lower() for token in tokens)
+                ),
+                None,
+            )
+
+        arm = architecture in {"arm64", "aarch64"}
+        if system == "darwin":
+            return find("arm64" if arm else "x64", ".dmg")
+        if system == "win32":
+            return find("arm64" if arm else "x64", "-setup.exe")
+        if system.startswith("linux"):
+            return find("arm64" if arm else "x86_64", ".appimage")
+        return None
+
     def _check_updates(self) -> None:
         if self._update_reply is not None:
             return
-        self._download_button.hide()
+        self._download_available = False
+        self._download_url = ""
+        self._download_name = ""
         self._check_update_button.setEnabled(False)
         self._check_update_button.setText("正在检查…")
+        self._check_update_button.setStyleSheet("")
         self._update_status.setStyleSheet("")
         self._update_status.setText("正在检查最新版本更新…")
         self._update_status.show()
@@ -2918,8 +2970,21 @@ class OtherSettingsDialog(QDialog):
             current = self._version_tuple(APP_VERSION)
             if latest > current:
                 self._update_status.setStyleSheet("color: #f59e0b;")
-                self._update_status.setText(f"发现新版本：{tag}（当前 {APP_VERSION}）")
-                self._download_button.show()
+                asset = self._select_release_asset(payload)
+                if asset is None:
+                    self._update_status.setText(
+                        f"发现新版本 {tag}，但暂无适用于当前系统的安装包。"
+                    )
+                else:
+                    self._download_url, self._download_name = asset
+                    self._download_available = True
+                    self._update_status.setText(f"发现新版本：{tag}（当前 {APP_VERSION}）")
+                    self._check_update_button.setText("下载新版更新")
+                    self._check_update_button.setStyleSheet(
+                        "QPushButton { color: white; background: #16a34a;"
+                        " border-color: #15803d; }"
+                        "QPushButton:hover { background: #15803d; }"
+                    )
             elif latest == current:
                 self._update_status.setStyleSheet("color: #22c55e;")
                 self._update_status.setText(f"当前已是最新版本（{APP_VERSION}）")
@@ -2935,12 +3000,109 @@ class OtherSettingsDialog(QDialog):
         self._update_reply = None
         if reply is not None:
             reply.abort()
+        download_reply = self._download_reply
+        self._download_reply = None
+        if download_reply is not None:
+            download_reply.abort()
+        if self._download_file is not None:
+            self._download_file.cancelWriting()
+            self._download_file = None
         self._check_update_button.setEnabled(True)
         self._check_update_button.setText("检查更新")
 
-    def _open_download(self) -> None:
-        if not QDesktopServices.openUrl(QUrl(self.RELEASES_URL)):
-            self._update_status.setText("无法打开浏览器，请访问项目 GitHub Releases 下载。")
+    def _handle_update_button(self) -> None:
+        if self._download_available:
+            self._download_update()
+            return
+        self._check_updates()
+
+    def _download_update(self) -> None:
+        if self._download_reply is not None:
+            return
+        if not self._download_url or not self._download_name:
+            self._update_status.setText("未找到适用于当前系统的安装包。")
+            return
+        download_dir = QStandardPaths.writableLocation(
+            QStandardPaths.StandardLocation.DownloadLocation
+        )
+        if not download_dir:
+            self._update_status.setText("无法获取系统下载文件夹。")
+            return
+        try:
+            target_dir = Path(download_dir)
+            target_dir.mkdir(parents=True, exist_ok=True)
+            target = target_dir / Path(self._download_name).name
+        except OSError:
+            self._update_status.setText("无法访问系统下载文件夹。")
+            return
+
+        download_file = QSaveFile(str(target))
+        if not download_file.open(QIODevice.OpenModeFlag.WriteOnly):
+            self._update_status.setText("无法创建下载文件，请检查文件夹权限。")
+            return
+        self._download_file = download_file
+        self._download_write_failed = False
+        self._check_update_button.setEnabled(False)
+        self._check_update_button.setText("正在下载…")
+        self._update_status.setStyleSheet("color: #f59e0b;")
+        self._update_status.setText(f"正在下载 {target.name}")
+
+        request = QNetworkRequest(QUrl(self._download_url))
+        request.setRawHeader(b"User-Agent", b"AlertZone-Desktop")
+        request.setTransferTimeout(120000)
+        request.setAttribute(
+            QNetworkRequest.Attribute.RedirectPolicyAttribute,
+            QNetworkRequest.RedirectPolicy.NoLessSafeRedirectPolicy,
+        )
+        reply = self._network.get(request)
+        self._download_reply = reply
+        reply.readyRead.connect(lambda: self._write_download_data(reply))
+        reply.downloadProgress.connect(self._update_download_progress)
+        reply.finished.connect(lambda: self._finish_download(reply, target))
+
+    def _write_download_data(self, reply: QNetworkReply) -> None:
+        if reply is not self._download_reply or self._download_file is None:
+            return
+        data = reply.readAll()
+        if not data.isEmpty() and self._download_file.write(data) != data.size():
+            self._download_write_failed = True
+            reply.abort()
+
+    def _update_download_progress(self, received: int, total: int) -> None:
+        if total <= 0:
+            return
+        percent = min(max(round(received * 100 / total), 0), 100)
+        self._check_update_button.setText(f"正在下载 {percent}%")
+
+    def _finish_download(self, reply: QNetworkReply, target: Path) -> None:
+        if reply is not self._download_reply:
+            reply.deleteLater()
+            return
+        self._write_download_data(reply)
+        self._download_reply = None
+        download_file = self._download_file
+        self._download_file = None
+        self._check_update_button.setEnabled(True)
+        failed = (
+            self._download_write_failed
+            or reply.error() != QNetworkReply.NetworkError.NoError
+            or download_file is None
+        )
+        committed = False
+        if not failed and download_file is not None:
+            committed = download_file.commit()
+        elif download_file is not None:
+            download_file.cancelWriting()
+        if failed or not committed:
+            self._update_status.setStyleSheet("color: #ef6670;")
+            self._update_status.setText("下载失败，请检查网络或下载文件夹权限后重试。")
+            self._check_update_button.setText("重试下载")
+        else:
+            self._update_status.setStyleSheet("color: #22c55e;")
+            self._update_status.setText(f"已下载到“下载”文件夹：{target.name}")
+            self._update_status.setToolTip(str(target))
+            self._check_update_button.setText("重新下载")
+        reply.deleteLater()
 
 
 class CloseActionDialog(QDialog):
