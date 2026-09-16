@@ -37,6 +37,7 @@ from PySide6.QtGui import (
     QCloseEvent,
     QColor,
     QCursor,
+    QDesktopServices,
     QDoubleValidator,
     QFontMetrics,
     QIcon,
@@ -101,8 +102,8 @@ except ImportError:
     objc = None
 
 APP_NAME = "AlertZone Desktop"
-APP_VERSION = "1.2.3"
-WINDOW_TITLE = f"{APP_NAME} {APP_VERSION} · ©H-Knight"
+APP_VERSION = "1.2.4"
+WINDOW_TITLE = APP_NAME
 ORGANIZATION_NAME = "AlertZone"
 SINGLE_INSTANCE_SERVER_NAME = "com.hknight.alertzone.desktop.instance"
 DEFAULT_PORT = 8765
@@ -435,7 +436,7 @@ class NativeMacTrayIcon:
             self._add_action("弹窗位置", "openPopupSettings:")
         )
         self._add_action("告警设置", "openAlertSettings:")
-        self._add_action("其他配置", "openOtherSettings:")
+        self._add_action("关于软件", "openOtherSettings:")
         self._menu.addItem_(AppKit.NSMenuItem.separatorItem())
         self._add_action("退出", "quitApplication:")
 
@@ -2448,7 +2449,7 @@ class AlertSettingsDialog(QDialog):
             Qt.ScrollBarPolicy.ScrollBarAlwaysOff
         )
         self.settings_scroll_area.setVerticalScrollBarPolicy(
-            Qt.ScrollBarPolicy.ScrollBarAsNeeded
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
         )
         self.settings_scroll_area.setWidget(settings_content)
 
@@ -2459,8 +2460,7 @@ class AlertSettingsDialog(QDialog):
         layout.addWidget(self.settings_scroll_area, 1)
         layout.addSpacing(2)
         layout.addLayout(self._dialog_buttons(self._save))
-        self.setMinimumSize(380, 380)
-        self.resize(400, 450)
+        self.setFixedSize(395, 450)
 
     def _sync_continuous_display_button(self, checked: bool) -> None:
         self.continuous_alert_display.setText(
@@ -2761,41 +2761,186 @@ class SoundSettingsSection(QFrame):
 
 
 class OtherSettingsDialog(QDialog):
-    """为后续扩展预留的其他配置菜单。"""
+    """软件版本、作者、GitHub 主页及手动检查更新。"""
+
+    RELEASES_URL = "https://github.com/HaoKnight/AlertZone-Desktop/releases/latest"
+    UPDATE_API = "https://api.github.com/repos/HaoKnight/AlertZone-Desktop/releases/latest"
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
-        self.setWindowTitle("其他配置")
-
-        title_label = QLabel("其他配置")
-        title_label.setObjectName("dialogSectionTitle")
-
-        empty_card = QFrame()
-        empty_card.setObjectName("dialogCard")
-        empty_layout = QVBoxLayout(empty_card)
-        empty_layout.setContentsMargins(12, 10, 12, 10)
-        empty_label = QLabel("暂无可配置项")
-        empty_label.setObjectName("dialogDescription")
-        empty_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        empty_label.setMinimumWidth(240)
-        empty_label.setMinimumHeight(28)
-        empty_layout.addWidget(empty_label)
-
-        close_button = QPushButton("关闭")
-        close_button.setObjectName("primaryButton")
-        close_button.clicked.connect(self.accept)
-        button_layout = QHBoxLayout()
-        button_layout.addStretch()
-        button_layout.addWidget(close_button)
-
+        self.setWindowTitle("关于软件")
+        self._network = QNetworkAccessManager(self)
+        self._update_reply: QNetworkReply | None = None
+        card = QFrame()
+        card.setObjectName("dialogCard")
+        card_layout = QVBoxLayout(card)
+        card_layout.setContentsMargins(16, 12, 16, 10)
+        card_layout.setSpacing(4)
+        icon_label = QLabel()
+        icon_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        icon_label.setAccessibleName(APP_NAME)
+        icon_path = app_icon_path()
+        app_icon = QIcon(str(icon_path)) if icon_path else QApplication.windowIcon()
+        if not app_icon.isNull():
+            icon_label.setPixmap(app_icon.pixmap(QSize(64, 64), self.devicePixelRatioF()))
+            card_layout.addWidget(icon_label)
+        name_label = QLabel(APP_NAME)
+        name_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        name_font = name_label.font()
+        name_font.setPointSize(20)
+        name_font.setBold(True)
+        name_label.setFont(name_font)
+        card_layout.addWidget(name_label)
+        description_label = QLabel("局域网实时监控与告警桌面客户端")
+        description_label.setObjectName("dialogDescription")
+        description_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        description_label.setWordWrap(True)
+        card_layout.addWidget(description_label)
+        version_label = QLabel(f"v{APP_VERSION}")
+        version_label.setObjectName("dialogDescription")
+        author_row = QHBoxLayout()
+        author_row.setSpacing(8)
+        author_row.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        author_label = QLabel("H-Knight")
+        author_label.setObjectName("dialogDescription")
+        github_button = QPushButton()
+        github_button.setObjectName("githubLinkButton")
+        github_button.setFixedSize(24, 24)
+        github_button.setToolTip("打开 GitHub 项目主页")
+        github_button.setAccessibleName("打开 GitHub 项目主页")
+        github_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        github_button.setStyleSheet(
+            "QPushButton#githubLinkButton { border: none; padding: 0;"
+            " background: transparent; }"
+        )
+        github_pixmap = QPixmap()
+        github_pixmap.loadFromData(
+            b'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" width="64" height="64">'
+            b'<path fill="#888888" d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59'
+            b' .4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94'
+            b' -.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82'
+            b' .72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95'
+            b' 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82'
+            b' .64-.18 1.32-.27 2-.27s1.36.09 2 .27c1.53-1.04 2.2-.82 2.2-.82'
+            b' .44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95'
+            b' .29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38'
+            b' A8.013 8.013 0 0 0 16 8c0-4.42-3.58-8-8-8z"/></svg>',
+            "SVG",
+        )
+        github_button.setIcon(QIcon(github_pixmap))
+        github_button.setIconSize(QSize(18, 18))
+        github_button.clicked.connect(
+            lambda: QDesktopServices.openUrl(
+                QUrl("https://github.com/HaoKnight/AlertZone-Desktop")
+            )
+        )
+        author_row.addWidget(github_button)
+        author_row.addWidget(author_label)
+        author_row.addWidget(version_label)
+        card_layout.addLayout(author_row)
+        self._update_status = QLabel()
+        self._update_status.setObjectName("dialogDescription")
+        self._update_status.setTextFormat(Qt.TextFormat.PlainText)
+        self._update_status.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._update_status.setWordWrap(True)
+        self._update_status.hide()
+        card_layout.addWidget(self._update_status)
+        self._check_update_button = QPushButton("检查更新")
+        self._check_update_button.clicked.connect(self._check_updates)
+        card_layout.addWidget(self._check_update_button)
+        self._download_button = QPushButton("前往 GitHub 下载")
+        self._download_button.clicked.connect(self._open_download)
+        self._download_button.hide()
+        card_layout.addWidget(self._download_button)
         layout = QVBoxLayout(self)
         layout.setContentsMargins(12, 14, 12, 12)
         layout.setSpacing(6)
-        layout.addWidget(title_label)
-        layout.addWidget(empty_card)
-        layout.addSpacing(6)
-        layout.addLayout(button_layout)
-        self.adjustSize()
+        layout.addWidget(card)
+        self.setFixedSize(280, 260)
+        self.finished.connect(self._cancel_update)
+
+    @staticmethod
+    def _version_tuple(version: str) -> tuple[int, int, int]:
+        # 正式发布使用 v主版本.次版本.修订号；按数字比较，避免 1.10 < 1.9。
+        parts = version.strip().removeprefix("v").split(".")
+        if len(parts) != 3 or not all(
+            part.isascii() and part.isdecimal() for part in parts
+        ):
+            raise ValueError("无法识别发布版本号")
+        return tuple(int(part) for part in parts)
+
+    def _check_updates(self) -> None:
+        if self._update_reply is not None:
+            return
+        self._download_button.hide()
+        self._check_update_button.setEnabled(False)
+        self._check_update_button.setText("正在检查…")
+        self._update_status.setStyleSheet("")
+        self._update_status.setText("正在检查最新版本更新…")
+        self._update_status.show()
+        request = QNetworkRequest(QUrl(self.UPDATE_API))
+        request.setRawHeader(b"Accept", b"application/vnd.github+json")
+        request.setRawHeader(b"User-Agent", b"AlertZone-Desktop")
+        request.setTransferTimeout(15000)
+        request.setAttribute(
+            QNetworkRequest.Attribute.CacheLoadControlAttribute,
+            QNetworkRequest.CacheLoadControl.AlwaysNetwork,
+        )
+        reply = self._network.get(request)
+        self._update_reply = reply
+        reply.finished.connect(lambda: self._finish_update(reply))
+
+    def _finish_update(self, reply: QNetworkReply) -> None:
+        if self._update_reply is not reply:
+            reply.deleteLater()
+            return
+        self._update_reply = None
+        self._check_update_button.setEnabled(True)
+        self._check_update_button.setText("检查更新")
+        try:
+            status = reply.attribute(QNetworkRequest.Attribute.HttpStatusCodeAttribute)
+            if status == 404:
+                self._update_status.setText("暂无可获取的正式版本，请稍后重试。")
+                return
+            if status in (403, 429):
+                self._update_status.setText("GitHub 暂时限制访问，请稍后重试。")
+                return
+            if reply.error() != QNetworkReply.NetworkError.NoError:
+                self._update_status.setText("检查失败，请检查网络连接后重试。")
+                return
+            payload = json.loads(bytes(reply.readAll()))
+            if not isinstance(payload, dict) or payload.get("draft") or payload.get("prerelease"):
+                raise ValueError("不是正式发布版本")
+            tag = payload.get("tag_name")
+            if not isinstance(tag, str):
+                raise ValueError("缺少版本号")
+            latest = self._version_tuple(tag)
+            current = self._version_tuple(APP_VERSION)
+            if latest > current:
+                self._update_status.setStyleSheet("color: #f59e0b;")
+                self._update_status.setText(f"发现新版本：{tag}（当前 {APP_VERSION}）")
+                self._download_button.show()
+            elif latest == current:
+                self._update_status.setStyleSheet("color: #22c55e;")
+                self._update_status.setText(f"当前已是最新版本（{APP_VERSION}）")
+            else:
+                self._update_status.setText(f"当前版本 {APP_VERSION} 高于最新正式版 {tag}。")
+        except (ValueError, TypeError, UnicodeError):
+            self._update_status.setText("无法读取 GitHub 版本信息，请稍后重试。")
+        finally:
+            reply.deleteLater()
+
+    def _cancel_update(self, *_args: Any) -> None:
+        reply = self._update_reply
+        self._update_reply = None
+        if reply is not None:
+            reply.abort()
+        self._check_update_button.setEnabled(True)
+        self._check_update_button.setText("检查更新")
+
+    def _open_download(self) -> None:
+        if not QDesktopServices.openUrl(QUrl(self.RELEASES_URL)):
+            self._update_status.setText("无法打开浏览器，请访问项目 GitHub Releases 下载。")
 
 
 class CloseActionDialog(QDialog):
@@ -3435,7 +3580,7 @@ class NativeDashboard(QWidget):
         self.preview_button = self._make_toggle_button("实时预览")
         self.alert_settings_button = QPushButton("告警设置")
         self.popup_settings_button = QPushButton("弹窗位置")
-        self.other_settings_button = QPushButton("其他配置")
+        self.other_settings_button = QPushButton("关于软件")
 
         self._controls = HoverRevealControls(
             [
@@ -4312,7 +4457,7 @@ class MainWindow(QMainWindow):
         )
         alert_settings_action = menu.addAction("告警设置")
         alert_settings_action.triggered.connect(self.open_alert_settings)
-        other_settings_action = menu.addAction("其他配置")
+        other_settings_action = menu.addAction("关于软件")
         other_settings_action.triggered.connect(self.open_other_settings)
         menu.addSeparator()
         quit_action = menu.addAction("退出")
@@ -4454,9 +4599,11 @@ class MainWindow(QMainWindow):
         if not self._icon.isNull():
             dialog.setWindowIcon(self._icon)
 
-    @staticmethod
-    def _raise_dialog(dialog: QDialog) -> None:
+    def _raise_dialog(self, dialog: QDialog) -> None:
         dialog.show()
+        dialog_geometry = dialog.frameGeometry()
+        dialog_geometry.moveCenter(self.frameGeometry().center())
+        dialog.move(dialog_geometry.topLeft())
         dialog.raise_()
         dialog.activateWindow()
 

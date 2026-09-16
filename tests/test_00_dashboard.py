@@ -85,12 +85,9 @@ class NativeDashboardTests(unittest.TestCase):
                 secondary.close()
             primary.close()
 
-    def test_main_window_title_uses_server_credit(self) -> None:
-        self.assertEqual(
-            WINDOW_TITLE,
-            "AlertZone Desktop 1.2.3 · ©H-Knight",
-        )
-        self.assertEqual(APP_VERSION, "1.2.3")
+    def test_main_window_title_uses_app_name_only(self) -> None:
+        self.assertEqual(WINDOW_TITLE, "AlertZone Desktop")
+        self.assertEqual(APP_VERSION, "1.2.4")
 
     def test_connection_page_cancel_button_emits_request(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -454,7 +451,7 @@ class NativeDashboardTests(unittest.TestCase):
             dashboard.set_alert_display_mode("zoom")
             self.assertTrue(dashboard.popup_settings_button.isEnabled())
             self.assertEqual(
-                dashboard.other_settings_button.text(), "其他配置"
+                dashboard.other_settings_button.text(), "关于软件"
             )
             self.assertEqual(
                 dashboard.alert_enabled_button.text(), "启用告警"
@@ -1898,11 +1895,36 @@ class NativeDashboardTests(unittest.TestCase):
             os.path.normcase(os.path.normpath(str(bundled_sound))),
         )
 
-    def test_other_settings_is_reserved_placeholder(self) -> None:
+    def test_other_settings_checks_release_versions_and_errors(self) -> None:
+        from PySide6.QtNetwork import QNetworkReply
+        import json
+
         dialog = OtherSettingsDialog()
-        self.assertEqual(dialog.windowTitle(), "其他配置")
-        labels = [label.text() for label in dialog.findChildren(QLabel)]
-        self.assertIn("暂无可配置项", labels)
+        self.assertEqual(dialog.windowTitle(), "关于软件")
+        cases = [
+            (200, {"tag_name": "v99.0.0"}, "发现新版本", True),
+            (200, {"tag_name": f"v{APP_VERSION}"}, "已是最新版本", False),
+            (200, {"tag_name": "v0.0.1"}, "高于最新正式版", False),
+            (200, {"tag_name": "invalid"}, "无法读取", False),
+            (200, [], "无法读取", False),
+            (404, {}, "暂无", False),
+            (403, {}, "限制访问", False),
+        ]
+        for status, payload, expected, download in cases:
+            with self.subTest(status=status, payload=payload):
+                reply = Mock()
+                reply.attribute.return_value = status
+                reply.error.return_value = QNetworkReply.NetworkError.NoError
+                reply.readAll.return_value = json.dumps(payload).encode()
+                dialog._download_button.hide()
+                dialog._update_reply = reply
+                dialog._finish_update(reply)
+                self.assertIn(expected, dialog._update_status.text())
+                self.assertEqual(not dialog._download_button.isHidden(), download)
+                self.assertIsNone(dialog._update_reply)
+                reply.deleteLater.assert_called_once()
+        self.assertGreater(dialog._version_tuple("v1.10.0"), dialog._version_tuple("1.9.9"))
+        dialog.deleteLater()
 
     def test_renders_status_without_web_page(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
