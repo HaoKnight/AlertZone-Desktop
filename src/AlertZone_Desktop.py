@@ -6,10 +6,15 @@
 
 from __future__ import annotations
 
+import base64
 import json
 import math
+import os
 import platform
+import shlex
+import subprocess
 import sys
+import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -2777,6 +2782,8 @@ class OtherSettingsDialog(QDialog):
         self._download_write_failed = False
         self._download_url = ""
         self._download_name = ""
+        self._install_available = False
+        self._downloaded_path: Path | None = None
         card = QFrame()
         card.setObjectName("dialogCard")
         card_layout = QVBoxLayout(card)
@@ -2922,14 +2929,16 @@ class OtherSettingsDialog(QDialog):
         if self._update_reply is not None:
             return
         self._download_available = False
+        self._install_available = False
+        self._downloaded_path = None
         self._download_url = ""
         self._download_name = ""
         self._check_update_button.setEnabled(False)
-        self._check_update_button.setText("正在检查…")
+        self._check_update_button.setText("正在检查更新版本…")
         self._check_update_button.setStyleSheet("")
         self._update_status.setStyleSheet("")
-        self._update_status.setText("正在检查最新版本更新…")
-        self._update_status.show()
+        self._update_status.clear()
+        self._update_status.hide()
         request = QNetworkRequest(QUrl(self.UPDATE_API))
         request.setRawHeader(b"Accept", b"application/vnd.github+json")
         request.setRawHeader(b"User-Agent", b"AlertZone-Desktop")
@@ -2949,6 +2958,7 @@ class OtherSettingsDialog(QDialog):
         self._update_reply = None
         self._check_update_button.setEnabled(True)
         self._check_update_button.setText("检查更新")
+        self._update_status.show()
         try:
             status = reply.attribute(QNetworkRequest.Attribute.HttpStatusCodeAttribute)
             if status == 404:
@@ -2986,8 +2996,16 @@ class OtherSettingsDialog(QDialog):
                         "QPushButton:hover { background: #15803d; }"
                     )
             elif latest == current:
-                self._update_status.setStyleSheet("color: #22c55e;")
-                self._update_status.setText(f"当前已是最新版本（{APP_VERSION}）")
+                self._update_status.clear()
+                self._update_status.hide()
+                self._check_update_button.setText(
+                    f"当前已是最新版本（{APP_VERSION}）"
+                )
+                self._check_update_button.setStyleSheet(
+                    "QPushButton { color: white; background: #16a34a;"
+                    " border-color: #15803d; }"
+                    "QPushButton:hover { background: #15803d; }"
+                )
             else:
                 self._update_status.setText(f"当前版本 {APP_VERSION} 高于最新正式版 {tag}。")
         except (ValueError, TypeError, UnicodeError):
@@ -3011,10 +3029,215 @@ class OtherSettingsDialog(QDialog):
         self._check_update_button.setText("检查更新")
 
     def _handle_update_button(self) -> None:
+        if self._install_available:
+            self._install_update()
+            return
         if self._download_available:
             self._download_update()
             return
         self._check_updates()
+
+    @staticmethod
+    def _current_installed_application() -> Path | None:
+        """返回正在运行的已打包应用；源码预览不执行自更新。"""
+        if not getattr(sys, "frozen", False):
+            return None
+        executable = Path(sys.executable).resolve()
+        if sys.platform == "darwin":
+            for candidate in (executable, *executable.parents):
+                if candidate.suffix.lower() == ".app":
+                    return candidate
+            return None
+        if sys.platform == "win32":
+            return executable
+        if sys.platform.startswith("linux"):
+            appimage = os.environ.get("APPIMAGE")
+            return Path(appimage).resolve() if appimage else None
+        return None
+
+    @staticmethod
+    def _powershell_quote(value: str) -> str:
+        return "'" + value.replace("'", "''") + "'"
+
+    def _launch_windows_installer(
+        self,
+        installer: Path,
+        current_executable: Path,
+    ) -> bool:
+        local_app_data = os.environ.get("LOCALAPPDATA")
+        installed_executable = (
+            Path(local_app_data) / "Programs" / APP_NAME / f"{APP_NAME}.exe"
+            if local_app_data
+            else current_executable
+        )
+        quote = self._powershell_quote
+        script = f"""
+$ErrorActionPreference = 'Stop'
+Wait-Process -Id {os.getpid()} -ErrorAction SilentlyContinue
+try {{
+    $installer = Start-Process -FilePath {quote(str(installer))} -ArgumentList @('/SILENT','/SUPPRESSMSGBOXES','/NORESTART') -PassThru -Wait
+    if ($installer.ExitCode -ne 0) {{ throw '安装程序执行失败' }}
+    $application = {quote(str(installed_executable))}
+    if (-not (Test-Path -LiteralPath $application)) {{
+        $application = {quote(str(current_executable))}
+    }}
+    if (-not (Test-Path -LiteralPath $application)) {{ throw '未找到新版程序' }}
+    Remove-Item -LiteralPath {quote(str(installer))} -Force
+    Start-Process -FilePath $application
+}} catch {{
+    if (Test-Path -LiteralPath {quote(str(current_executable))}) {{
+        Start-Process -FilePath {quote(str(current_executable))}
+    }}
+    exit 1
+}}
+"""
+        encoded = base64.b64encode(script.encode("utf-16le")).decode("ascii")
+        try:
+            subprocess.Popen(
+                [
+                    "powershell.exe",
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-WindowStyle",
+                    "Hidden",
+                    "-EncodedCommand",
+                    encoded,
+                ],
+                close_fds=True,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+        except OSError:
+            return False
+        return True
+
+    def _write_macos_update_helper(
+        self,
+        installer: Path,
+        current_app: Path,
+    ) -> Path:
+        descriptor, helper_name = tempfile.mkstemp(
+            prefix="alertzone-update-",
+            suffix=".sh",
+        )
+        helper = Path(helper_name)
+        staging = current_app.with_name(f".{current_app.name}.updating")
+        backup = current_app.with_name(f".{current_app.name}.previous")
+        q = shlex.quote
+        script = f"""#!/bin/sh
+set -u
+installer={q(str(installer))}
+target={q(str(current_app))}
+staging={q(str(staging))}
+backup={q(str(backup))}
+helper={q(str(helper))}
+parent_pid={os.getpid()}
+mount=''
+installed=0
+cleanup() {{
+    status=$?
+    trap - EXIT HUP INT TERM
+    if [ -n "$mount" ] && [ -d "$mount" ]; then
+        /usr/bin/hdiutil detach "$mount" -quiet >/dev/null 2>&1 || true
+        /bin/rm -rf "$mount"
+    fi
+    if [ "$installed" -eq 1 ]; then
+        /bin/rm -f "$installer"
+    else
+        /bin/rm -rf "$staging"
+        if [ -d "$backup" ]; then
+            /bin/rm -rf "$target"
+            /bin/mv "$backup" "$target" || true
+        fi
+    fi
+    if [ -d "$target" ]; then /usr/bin/open "$target" || true; fi
+    /bin/rm -f "$helper"
+    exit "$status"
+}}
+trap cleanup EXIT HUP INT TERM
+while /bin/kill -0 "$parent_pid" 2>/dev/null; do /bin/sleep 0.2; done
+mount=$(/usr/bin/mktemp -d /private/tmp/alertzone-update.XXXXXX) || exit 1
+/usr/bin/hdiutil attach "$installer" -nobrowse -readonly -mountpoint "$mount" -quiet || exit 1
+source_app=$(/usr/bin/find "$mount" -maxdepth 2 -type d -name {q(APP_NAME + '.app')} -print -quit)
+[ -n "$source_app" ] || exit 1
+/bin/rm -rf "$staging" "$backup"
+/usr/bin/ditto "$source_app" "$staging" || exit 1
+/usr/bin/codesign --verify --deep --strict "$staging" || exit 1
+bundle_id=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$staging/Contents/Info.plist" 2>/dev/null)
+[ "$bundle_id" = 'com.hknight.alertzone.desktop' ] || exit 1
+if [ -d "$target" ]; then /bin/mv "$target" "$backup" || exit 1; fi
+/bin/mv "$staging" "$target" || exit 1
+/usr/bin/codesign --verify --deep --strict "$target" || exit 1
+installed=1
+/bin/rm -rf "$backup"
+exit 0
+"""
+        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+            stream.write(script)
+        helper.chmod(0o700)
+        return helper
+
+    def _launch_macos_installer(self, installer: Path, current_app: Path) -> bool:
+        try:
+            helper = self._write_macos_update_helper(installer, current_app)
+            command = (
+                f"/usr/bin/nohup /bin/sh {shlex.quote(str(helper))} "
+                ">/dev/null 2>&1 &"
+            )
+            if os.access(current_app.parent, os.W_OK):
+                subprocess.Popen(
+                    ["/bin/sh", str(helper)],
+                    start_new_session=True,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+                return True
+            apple_script_command = command.replace("\\", "\\\\").replace('"', '\\"')
+            result = subprocess.run(
+                [
+                    "/usr/bin/osascript",
+                    "-e",
+                    f'do shell script "{apple_script_command}" with administrator privileges',
+                ],
+                check=False,
+            )
+            if result.returncode == 0:
+                return True
+            helper.unlink(missing_ok=True)
+        except OSError:
+            if "helper" in locals():
+                helper.unlink(missing_ok=True)
+        return False
+
+    def _install_update(self) -> None:
+        installer = self._downloaded_path
+        if installer is None or not installer.is_file():
+            self._install_available = False
+            self._update_status.setStyleSheet("color: #ef6670;")
+            self._update_status.setText("安装包不存在，请重新下载。")
+            self._check_update_button.setText("重新下载")
+            return
+        current_application = self._current_installed_application()
+        if current_application is None:
+            self._update_status.setStyleSheet("color: #ef6670;")
+            self._update_status.setText("自动安装仅支持已打包的软件版本。")
+            return
+        launched = False
+        if sys.platform == "darwin" and installer.suffix.lower() == ".dmg":
+            install_target = current_application
+            if str(current_application).startswith("/Volumes/"):
+                install_target = Path("/Applications") / f"{APP_NAME}.app"
+            launched = self._launch_macos_installer(installer, install_target)
+        elif sys.platform == "win32" and installer.suffix.lower() == ".exe":
+            launched = self._launch_windows_installer(installer, current_application)
+        if not launched:
+            self._update_status.setStyleSheet("color: #ef6670;")
+            self._update_status.setText("无法启动安装程序，请稍后重试。")
+            return
+        self._check_update_button.setEnabled(False)
+        self._check_update_button.setText("正在启动安装…")
+        self._update_status.setStyleSheet("color: #22c55e;")
+        self._update_status.setText("即将关闭当前程序并安装新版。")
+        QTimer.singleShot(0, QApplication.quit)
 
     def _download_update(self) -> None:
         if self._download_reply is not None:
@@ -3094,14 +3317,24 @@ class OtherSettingsDialog(QDialog):
         elif download_file is not None:
             download_file.cancelWriting()
         if failed or not committed:
+            self._install_available = False
+            self._downloaded_path = None
             self._update_status.setStyleSheet("color: #ef6670;")
             self._update_status.setText("下载失败，请检查网络或下载文件夹权限后重试。")
             self._check_update_button.setText("重试下载")
         else:
+            self._download_available = False
+            self._install_available = True
+            self._downloaded_path = target
             self._update_status.setStyleSheet("color: #22c55e;")
-            self._update_status.setText(f"已下载到“下载”文件夹：{target.name}")
+            self._update_status.setText("新版已下载，可以开始安装。")
             self._update_status.setToolTip(str(target))
-            self._check_update_button.setText("重新下载")
+            self._check_update_button.setText("安装新版")
+            self._check_update_button.setStyleSheet(
+                "QPushButton { color: white; background: #16a34a;"
+                " border-color: #15803d; }"
+                "QPushButton:hover { background: #15803d; }"
+            )
         reply.deleteLater()
 
 

@@ -1901,6 +1901,18 @@ class NativeDashboardTests(unittest.TestCase):
 
         dialog = OtherSettingsDialog()
         self.assertEqual(dialog.windowTitle(), "关于软件")
+        pending_reply = Mock()
+        dialog._network = Mock()
+        dialog._network.get.return_value = pending_reply
+        dialog._check_updates()
+        self.assertEqual(
+            dialog._check_update_button.text(), "正在检查更新版本…"
+        )
+        self.assertFalse(dialog._check_update_button.isEnabled())
+        self.assertEqual(dialog._update_status.text(), "")
+        self.assertTrue(dialog._update_status.isHidden())
+        pending_reply.finished.connect.assert_called_once()
+        dialog._update_reply = None
         assets = [
             {"name": "AlertZone.Desktop_99.0.0_arm64.dmg", "browser_download_url": "https://example.com/mac-arm.dmg"},
             {"name": "AlertZone.Desktop_99.0.0_x64.dmg", "browser_download_url": "https://example.com/mac-x64.dmg"},
@@ -1927,13 +1939,27 @@ class NativeDashboardTests(unittest.TestCase):
                 dialog._download_available = False
                 dialog._check_update_button.setText("检查更新")
                 dialog._check_update_button.setStyleSheet("")
+                dialog._update_status.show()
                 dialog._update_reply = reply
                 dialog._finish_update(reply)
-                self.assertIn(expected, dialog._update_status.text())
+                is_latest = (
+                    isinstance(payload, dict)
+                    and payload.get("tag_name") == f"v{APP_VERSION}"
+                )
+                if is_latest:
+                    self.assertIn(expected, dialog._check_update_button.text())
+                    self.assertTrue(dialog._update_status.isHidden())
+                else:
+                    self.assertIn(expected, dialog._update_status.text())
+                    self.assertFalse(dialog._update_status.isHidden())
                 self.assertEqual(dialog._download_available, download)
                 self.assertEqual(
                     dialog._check_update_button.text(),
-                    "下载新版更新" if download else "检查更新",
+                    "下载新版更新"
+                    if download
+                    else f"当前已是最新版本（{APP_VERSION}）"
+                    if is_latest
+                    else "检查更新",
                 )
                 self.assertIsNone(dialog._update_reply)
                 reply.deleteLater.assert_called_once()
@@ -1954,6 +1980,12 @@ class NativeDashboardTests(unittest.TestCase):
         with patch.object(dialog, "_download_update") as download_update:
             dialog._handle_update_button()
         download_update.assert_called_once_with()
+        dialog._download_available = False
+        dialog._install_available = True
+        with patch.object(dialog, "_install_update") as install_update:
+            dialog._handle_update_button()
+        install_update.assert_called_once_with()
+        dialog._install_available = False
 
         from pathlib import Path
         from PySide6.QtCore import QByteArray, QIODevice, QSaveFile
@@ -1972,11 +2004,38 @@ class NativeDashboardTests(unittest.TestCase):
             dialog._download_write_failed = False
             dialog._finish_download(reply, target)
             self.assertEqual(target.read_bytes(), b"installer-data")
-            self.assertIn("已下载到", dialog._update_status.text())
+            self.assertIn("可以开始安装", dialog._update_status.text())
             self.assertEqual(
-                dialog._check_update_button.text(), "重新下载"
+                dialog._check_update_button.text(), "安装新版"
             )
+            self.assertTrue(dialog._install_available)
+            self.assertEqual(dialog._downloaded_path, target)
             reply.deleteLater.assert_called_once()
+            dialog._download_available = False
+            dialog._install_available = True
+            with patch.object(
+                dialog,
+                "_current_installed_application",
+                return_value=Path("/Applications/AlertZone Desktop.app"),
+            ), patch.object(
+                dialog,
+                "_launch_macos_installer",
+                return_value=True,
+            ) as launch, patch(
+                "src.AlertZone_Desktop.sys.platform",
+                "darwin",
+            ), patch(
+                "src.AlertZone_Desktop.QTimer.singleShot"
+            ) as single_shot:
+                dialog._install_update()
+            launch.assert_called_once_with(
+                target,
+                Path("/Applications/AlertZone Desktop.app"),
+            )
+            single_shot.assert_called_once()
+            self.assertEqual(
+                dialog._check_update_button.text(), "正在启动安装…"
+            )
         self.assertGreater(dialog._version_tuple("v1.10.0"), dialog._version_tuple("1.9.9"))
         dialog.deleteLater()
 
