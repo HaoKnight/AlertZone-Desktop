@@ -1955,7 +1955,7 @@ class NativeDashboardTests(unittest.TestCase):
                 self.assertEqual(dialog._download_available, download)
                 self.assertEqual(
                     dialog._check_update_button.text(),
-                    "下载新版更新"
+                    "下载更新"
                     if download
                     else f"当前已是最新版本（{APP_VERSION}）"
                     if is_latest
@@ -1992,6 +1992,7 @@ class NativeDashboardTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as temp_dir:
             target = Path(temp_dir) / "AlertZone-update.dmg"
+            dialog._download_version = "v99.0.0"
             download_file = QSaveFile(str(target))
             self.assertTrue(
                 download_file.open(QIODevice.OpenModeFlag.WriteOnly)
@@ -2004,9 +2005,9 @@ class NativeDashboardTests(unittest.TestCase):
             dialog._download_write_failed = False
             dialog._finish_download(reply, target)
             self.assertEqual(target.read_bytes(), b"installer-data")
-            self.assertIn("可以开始安装", dialog._update_status.text())
+            self.assertEqual(dialog._update_status.text(), "v99.0.0 已下载完成")
             self.assertEqual(
-                dialog._check_update_button.text(), "安装新版"
+                dialog._check_update_button.text(), "立即安装"
             )
             self.assertTrue(dialog._install_available)
             self.assertEqual(dialog._downloaded_path, target)

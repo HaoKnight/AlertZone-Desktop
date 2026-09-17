@@ -2782,6 +2782,7 @@ class OtherSettingsDialog(QDialog):
         self._download_write_failed = False
         self._download_url = ""
         self._download_name = ""
+        self._download_version = ""
         self._install_available = False
         self._downloaded_path: Path | None = None
         card = QFrame()
@@ -2933,6 +2934,7 @@ class OtherSettingsDialog(QDialog):
         self._downloaded_path = None
         self._download_url = ""
         self._download_name = ""
+        self._download_version = ""
         self._check_update_button.setEnabled(False)
         self._check_update_button.setText("正在检查更新版本…")
         self._check_update_button.setStyleSheet("")
@@ -2987,9 +2989,10 @@ class OtherSettingsDialog(QDialog):
                     )
                 else:
                     self._download_url, self._download_name = asset
+                    self._download_version = tag if tag.startswith("v") else f"v{tag}"
                     self._download_available = True
                     self._update_status.setText(f"发现新版本：{tag}（当前 {APP_VERSION}）")
-                    self._check_update_button.setText("下载新版更新")
+                    self._check_update_button.setText("下载更新")
                     self._check_update_button.setStyleSheet(
                         "QPushButton { color: white; background: #16a34a;"
                         " border-color: #15803d; }"
@@ -3267,7 +3270,7 @@ exit 0
         self._download_write_failed = False
         self._check_update_button.setEnabled(False)
         self._check_update_button.setText("正在下载…")
-        self._update_status.setStyleSheet("color: #f59e0b;")
+        self._update_status.setStyleSheet("color: #f59e0b; font-size: 11px;")
         self._update_status.setText(f"正在下载 {target.name}")
 
         request = QNetworkRequest(QUrl(self._download_url))
@@ -3327,9 +3330,10 @@ exit 0
             self._install_available = True
             self._downloaded_path = target
             self._update_status.setStyleSheet("color: #22c55e;")
-            self._update_status.setText("新版已下载，可以开始安装。")
+            version = self._download_version or "新版"
+            self._update_status.setText(f"{version} 已下载完成")
             self._update_status.setToolTip(str(target))
-            self._check_update_button.setText("安装新版")
+            self._check_update_button.setText("立即安装")
             self._check_update_button.setStyleSheet(
                 "QPushButton { color: white; background: #16a34a;"
                 " border-color: #15803d; }"
