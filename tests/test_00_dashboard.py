@@ -87,7 +87,7 @@ class NativeDashboardTests(unittest.TestCase):
 
     def test_main_window_title_uses_app_name_only(self) -> None:
         self.assertEqual(WINDOW_TITLE, "AlertZone Desktop")
-        self.assertEqual(APP_VERSION, "1.2.4")
+        self.assertEqual(APP_VERSION, "1.2.5")
 
     def test_connection_page_cancel_button_emits_request(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

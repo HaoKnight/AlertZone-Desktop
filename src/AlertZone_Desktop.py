@@ -104,7 +104,7 @@ except ImportError:
     objc = None
 
 APP_NAME = "AlertZone Desktop"
-APP_VERSION = "1.2.4"
+APP_VERSION = "1.2.5"
 WINDOW_TITLE = APP_NAME
 ORGANIZATION_NAME = "AlertZone"
 SINGLE_INSTANCE_SERVER_NAME = "com.hknight.alertzone.desktop.instance"

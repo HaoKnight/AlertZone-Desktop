@@ -18,7 +18,7 @@ AlertZone Desktop 是 AlertZone Server的桌面客户端，通过局域网连接
 
 ## 📦 下载
 
-当前版本：**1.2.4**。前往 [GitHub Releases](https://github.com/HaoKnight/AlertZone-Desktop/releases/latest) 下载安装包，
+当前版本：**1.2.5**。前往 [GitHub Releases](https://github.com/HaoKnight/AlertZone-Desktop/releases/latest) 下载安装包，
 更新内容见 [更新日志](release_notes.md)。
 
 - **Windows**：64 位安装版或便携版（免安装）。
